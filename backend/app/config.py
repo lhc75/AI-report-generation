@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost:5173"
 
     # 生成
-    GENERATE_CONCURRENCY: int = 2  # 同时执行的生成任务上限，超出排队
+    GENERATE_CONCURRENCY: int = 5  # 同时执行的生成任务上限，超出排队
     REVIEW_CONCURRENCY: int = 5  # 导出前逐模块 AI 复核的并发上限（网关不稳时可调小）
     REACT_MAX_TURNS: int = 10  # ReAct 智能体单任务最大思考-行动轮次
     REACT_MAX_RUN_FAILURES: int = 5  # 连续 run_python 执行失败达到此次数判定任务不可完成
