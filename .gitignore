@@ -1,0 +1,44 @@
+# 环境与密钥
+.env
+.env.*
+!.env.example
+backend/config/.env.test
+app-secrets.json
+
+# Python
+backend/.venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行数据与日志
+backend/data/
+data/
+output/
+log/
+logs/
+*.log
+*.pid
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/dev.err.log
+frontend/dev.out.log
+
+# Electron / 打包产物
+desktop/node_modules/
+build/
+release/
+dist/
+.cache/
+*.bundle
+
+# 工具与系统文件
+.playwright-cli/
+.DS_Store
+.idea/
+.vscode/
+验证产物-*/

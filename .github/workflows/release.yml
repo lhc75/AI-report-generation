@@ -1,0 +1,133 @@
+name: Release
+
+# 推送 v* 标签时自动打包 Windows / macOS 客户端并创建 GitHub Release；
+# 也可以在 Actions 页面手动触发（只产出 Actions 产物，不创建 Release）。
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      # 内置 Python 运行时与 Electron 安装包体积较大，缓存后二次构建明显加速。
+      - name: Cache build downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/cache
+            .cache/electron
+            .cache/electron-builder
+          key: build-cache-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json', 'backend/requirements.txt', 'scripts/build-desktop.mjs') }}
+          restore-keys: |
+            build-cache-${{ runner.os }}-
+
+      - name: Build Windows client
+        run: node scripts/build-desktop.mjs --platform=win
+
+      # NSIS 安装包 + portable 便携版
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: release/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  build-macos:
+    runs-on: macos-latest # Apple Silicon，与 electron-builder.mac.js 的 arm64 目标一致
+    timeout-minutes: 120
+    env:
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Cache build downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/cache
+            .cache/electron
+            .cache/electron-builder
+          key: build-cache-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json', 'backend/requirements.txt', 'scripts/build-desktop.mjs') }}
+          restore-keys: |
+            build-cache-${{ runner.os }}-
+
+      - name: Build macOS client
+        run: node scripts/build-desktop.mjs --platform=mac
+
+      # dmg 安装镜像 + zip（供直接分发）
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # 仅在推送 v* 标签时运行：把两个平台的产物挂到 GitHub Release 上。
+  publish-release:
+    needs: [build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist/win
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: dist/mac
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/win/* dist/mac/* \
+              -R "${{ github.repository }}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/win/* dist/mac/* \
+              -R "${{ github.repository }}" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

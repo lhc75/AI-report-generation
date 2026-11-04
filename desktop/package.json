@@ -1,0 +1,18 @@
+{
+  "name": "ai-report-desktop",
+  "version": "1.0.0",
+  "description": "AI 报告生成 - Electron 桌面端",
+  "appDisplayName": "AI报告生成",
+  "main": "main.js",
+  "author": "lhc75",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win --x64 --config electron-builder.win.js",
+    "dist:mac": "electron-builder --mac --arm64 --config electron-builder.mac.js"
+  },
+  "devDependencies": {
+    "electron": "33.4.11",
+    "electron-builder": "^26.0.12"
+  }
+}
