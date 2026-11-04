@@ -159,7 +159,7 @@ Electron/electron-builder 二进制（CI 环境走官方源），也可通过 `E
 流水线见 [.github/workflows/release.yml](.github/workflows/release.yml)：
 
 1. 修改 `desktop/package.json` 的 `version`。
-2. 提交并推送后打标签（示例为 `v1.0.0`）：
+2. 提交并推送后打标签（示例为 `v1.0.1`）：
 
 ```bash
 git tag v1.0.0

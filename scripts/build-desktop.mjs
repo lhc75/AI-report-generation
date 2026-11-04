@@ -206,7 +206,10 @@ async function preparePython() {
     console.log('    依赖未变化，跳过 pip install');
   }
 
-  run(pythonExe, ['-c', 'import fastapi, uvicorn, sqlalchemy; print("内置 Python 依赖检查通过")']);
+  // 用纯 ASCII 输出做自检：Windows 控制台默认 cp1252，中文会触发 UnicodeEncodeError。
+  run(pythonExe, ['-c', 'import fastapi, uvicorn, sqlalchemy; print("backend runtime ok")'], {
+    env: { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+  });
 }
 
 function stageFiles() {
