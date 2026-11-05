@@ -17,6 +17,7 @@ module.exports = {
   files: [
     'main.js',
     'preload.js',
+    'update-installer.js',
     'package.json',
     'icon.png',
     '!**/*.test.js',

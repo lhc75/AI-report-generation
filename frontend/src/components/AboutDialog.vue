@@ -214,7 +214,8 @@ async function install() {
   installing.value = true
   installMessage.value = ''
   try {
-    const result = await window.aiReportDesktop.installUpdate(asset)
+    const result = await window.aiReportDesktop.installUpdate(
+      asset, update.value?.assets || [])
     installed.value = true
     installMessage.value = result?.message || '安装程序已启动'
     if (result?.mode !== 'auto') installing.value = false

@@ -13,6 +13,7 @@ const https = require('https');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+const { buildWindowsInstallScript, encodePowerShell } = require('./update-installer');
 
 const APP_NAME = 'AI报告生成';
 const PREFERRED_PORT = 18080;
@@ -385,26 +386,35 @@ async function installOnMac(file, name) {
 }
 
 async function installOnWindows(file, name) {
-  const lower = name.toLowerCase();
-  if (lower.includes('portable')) {
-    shell.showItemInFolder(file);
-    return { mode: 'manual', message: '已下载便携版，请关闭应用后手动替换。' };
+  const portableFile = process.env.PORTABLE_EXECUTABLE_FILE || '';
+  if (portableFile) {
+    try {
+      fs.accessSync(path.dirname(portableFile), fs.constants.W_OK);
+    } catch (_) {
+      shell.showItemInFolder(file);
+      return { mode: 'manual', message: '便携版所在目录不可写，已打开下载的更新包，请手动替换。' };
+    }
   }
-  // 等主进程退出后再运行安装程序，避免占用中的后端/Python 文件导致覆盖失败。
-  const script = path.join(os.tmpdir(), `ai-report-install-${process.pid}-${Date.now()}.ps1`);
-  const quote = (value) => `'${String(value).replace(/'/g, "''")}'`;
-  fs.writeFileSync(script, [
-    `Wait-Process -Id ${process.pid} -ErrorAction SilentlyContinue`,
-    `Start-Process -FilePath ${quote(file)} -ArgumentList '/S'`,
-    'Start-Sleep -Seconds 2',
-    `Remove-Item -LiteralPath ${quote(script)} -Force -ErrorAction SilentlyContinue`,
-  ].join('\r\n') + '\r\n', { encoding: 'utf8' });
+  // 便携版直接替换当前 exe；安装版静默运行 NSIS 后在原路径重启应用。
+  const script = buildWindowsInstallScript({
+    pid: process.pid,
+    installer: file,
+    relaunch: process.execPath,
+    downloaded: file,
+    portableFile,
+  });
   const helper = spawn('powershell.exe', [
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script,
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-WindowStyle', 'Hidden', '-EncodedCommand', encodePowerShell(script),
   ], { detached: true, stdio: 'ignore', windowsHide: true });
   helper.unref();
   setTimeout(() => app.quit(), 400);
-  return { mode: 'auto', message: '更新已下载，应用关闭后会自动运行安装程序。' };
+  return {
+    mode: 'auto',
+    message: portableFile
+      ? '更新已下载，应用关闭后会自动替换便携版并重新启动。'
+      : '更新已下载，应用关闭后会自动安装并重新启动。',
+  };
 }
 
 function cleanUpdateDir(keepName) {
@@ -416,9 +426,15 @@ function cleanUpdateDir(keepName) {
   }
 }
 
-ipcMain.handle('update:install', async (_event, asset) => {
-  const url = String(asset?.url || '');
-  const rawName = String(asset?.name || '');
+ipcMain.handle('update:install', async (_event, asset, assets) => {
+  let effective = asset;
+  if (process.platform === 'win32' && process.env.PORTABLE_EXECUTABLE_FILE) {
+    const portable = (Array.isArray(assets) ? assets : [])
+      .find((item) => item && item.kind === 'portable');
+    if (portable) effective = portable;
+  }
+  const url = String(effective?.url || '');
+  const rawName = String(effective?.name || '');
   const name = path.basename(rawName);
   if (!name || !isAllowedUpdateUrl(url)) {
     throw new Error('更新包信息无效');
@@ -426,7 +442,7 @@ ipcMain.handle('update:install', async (_event, asset) => {
   fs.mkdirSync(UPDATE_DIR, { recursive: true });
   cleanUpdateDir(name);
   const target = path.join(UPDATE_DIR, name);
-  sendUpdateProgress({ phase: 'downloading', received: 0, total: Number(asset?.size || 0) });
+  sendUpdateProgress({ phase: 'downloading', received: 0, total: Number(effective?.size || 0) });
   await downloadUpdateFile(url, target, (progress) => {
     sendUpdateProgress({ phase: 'downloading', ...progress });
   });

@@ -54,6 +54,10 @@ jobs:
         run: node --check main.js
       - name: Syntax check preload script
         run: node --check preload.js
+      - name: Syntax check update installer
+        run: node --check update-installer.js
+      - name: Unit test update installer
+        run: node --test update-installer.test.js
       - name: Syntax check builder configs
         run: |
           node --check electron-builder.base.js
