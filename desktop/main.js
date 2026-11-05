@@ -426,11 +426,18 @@ function cleanUpdateDir(keepName) {
   }
 }
 
-ipcMain.handle('update:install', async (_event, asset, assets) => {
-  let effective = asset;
+ipcMain.handle('update:install', async (_event, payload) => {
+  let data;
+  try {
+    // 前端传 JSON 字符串：Vue 响应式 Proxy 无法通过 Electron 的结构化克隆。
+    data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+  } catch (_) {
+    throw new Error('更新包信息无效');
+  }
+  let effective = data.asset;
+  const assets = Array.isArray(data.assets) ? data.assets : [];
   if (process.platform === 'win32' && process.env.PORTABLE_EXECUTABLE_FILE) {
-    const portable = (Array.isArray(assets) ? assets : [])
-      .find((item) => item && item.kind === 'portable');
+    const portable = assets.find((item) => item && item.kind === 'portable');
     if (portable) effective = portable;
   }
   const url = String(effective?.url || '');

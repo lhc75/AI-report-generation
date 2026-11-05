@@ -7,7 +7,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('aiReportDesktop', {
   isDesktop: true,
-  installUpdate: (asset, assets) => ipcRenderer.invoke('update:install', asset, assets),
+  installUpdate: (payload) => ipcRenderer.invoke('update:install', payload),
   onUpdateProgress: (callback) => {
     const handler = (_event, payload) => callback(payload);
     ipcRenderer.on('update:progress', handler);

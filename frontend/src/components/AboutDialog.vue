@@ -108,6 +108,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 import { checkUpdate, getAbout } from '../api'
+import { serializeInstallPayload } from '../updatePayload'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -215,7 +216,7 @@ async function install() {
   installMessage.value = ''
   try {
     const result = await window.aiReportDesktop.installUpdate(
-      asset, update.value?.assets || [])
+      serializeInstallPayload(asset, update.value?.assets || []))
     installed.value = true
     installMessage.value = result?.message || '安装程序已启动'
     if (result?.mode !== 'auto') installing.value = false
