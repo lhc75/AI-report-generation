@@ -27,3 +27,12 @@ api.interceptors.response.use(
 )
 
 export default api
+
+export function getAbout() {
+  return api.get('/app/about').then((resp) => resp.data)
+}
+
+export function checkUpdate(force = false) {
+  return api.get('/app/update', { params: { force }, silentError: true })
+    .then((resp) => resp.data)
+}

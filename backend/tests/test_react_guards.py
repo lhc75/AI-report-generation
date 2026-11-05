@@ -136,3 +136,65 @@ def test_parse_action_recovers_dsml_variants():
         '<||DSML|| parameter name="action_input">完成</||DSML|| parameter>'
     )
     assert generate.parse_action(half_width) == {"action": "finish", "action_input": "完成"}
+
+
+def test_no_turn_cap_runs_beyond_ten(monkeypatch):
+    """默认不设轮次上限：超过旧版 10 轮仍继续，直到模型自己 finish。"""
+    state = {"n": 0}
+
+    async def fake_chat(cfg, messages, **kwargs):
+        state["n"] += 1
+        if state["n"] <= 15:
+            return action("run_python", f"print({state['n']})")
+        return action("finish", "完成")
+
+    result = run_react(fake_chat, monkeypatch, REACT_MAX_TURNS=0,
+                       REACT_STALE_FINISH_NUDGE=99)
+    assert result == "完成"
+    assert state["n"] == 16
+
+
+def test_time_budget_stops_unbounded_run(monkeypatch):
+    async def fake_chat(cfg, messages, **kwargs):
+        await asyncio.sleep(0.01)
+        return action("run_python", "print(1)")
+
+    with pytest.raises(generate.ReactRunError, match="已运行"):
+        run_react(fake_chat, monkeypatch, REACT_MAX_TURNS=0, REACT_MAX_SECONDS=0.005,
+                  REACT_STALE_FINISH_NUDGE=99)
+
+
+def test_failure_digest_is_carried_by_run_error(monkeypatch):
+    state = {"n": 0}
+
+    async def fake_chat(cfg, messages, **kwargs):
+        state["n"] += 1
+        return action("finish", f"坏成果{state['n']}")
+
+    def reject(payload, workdir):
+        return False, f"校验失败：{payload}", ""
+
+    monkeypatch.setattr(generate, "chat_completion", fake_chat)
+    monkeypatch.setattr(generate.settings, "REACT_MAX_TURNS", 3)
+    with pytest.raises(generate.ReactRunError) as info:
+        asyncio.run(generate.react_run(None, make_cfg(), "目标", None, "text",
+                                       finish_validator=reject))
+    assert "finish 被拒" in info.value.failure_digest
+    assert "校验失败" in info.value.failure_digest
+
+
+def test_repeated_failure_observation_trips_breaker(monkeypatch, tmp_path):
+    state = {"n": 0}
+
+    async def fake_chat(cfg, messages, **kwargs):
+        state["n"] += 1
+        return action("run_python", f"print({state['n']})")
+
+    def failing_run(code, workdir):
+        return {"ok": False, "stdout": "", "stderr": "KeyError: 'q7'"}
+
+    monkeypatch.setattr(generate, "chat_completion", fake_chat)
+    monkeypatch.setattr(generate.sandbox, "run_python", failing_run)
+    with pytest.raises(generate.ReactRunError, match="相同失败观察"):
+        asyncio.run(generate.react_run(None, make_cfg(), "目标", tmp_path, "text",
+                                       finish_validator=ok_validator))

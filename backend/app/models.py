@@ -154,6 +154,9 @@ class ModuleContent(Base):
     prompt: Mapped[str] = mapped_column(Text, default="")  # 本次生成使用的用户补充提示词
     status: Mapped[str] = mapped_column(String(16), default="ok")  # ok/failed
     error_msg: Mapped[str] = mapped_column(Text, default="")
+    # 失败过程摘要（最近几轮的具体错误与最后动作），下一次生成时注入提示词；
+    # 与 error_msg 分开存放，避免界面提示被长文本淹没。
+    failure_digest: Mapped[str] = mapped_column(Text, default="")
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 

@@ -86,6 +86,7 @@ for _table, _column, _type, _default in [
     ("chapter_task", "template_instruction", "TEXT", "''"),
     ("module_content", "material_revision", "INTEGER", "0"),
     ("module_content", "instruction_revision", "INTEGER", "0"),
+    ("module_content", "failure_digest", "TEXT", "''"),
 ]:
     _COLUMN_MIGRATIONS.append((_table, _column,
         f"ALTER TABLE `{_table}` ADD COLUMN `{_column}` {_type} NOT NULL DEFAULT {_default}"))

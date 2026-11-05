@@ -16,6 +16,7 @@ module.exports = {
   npmRebuild: false,
   files: [
     'main.js',
+    'preload.js',
     'package.json',
     'icon.png',
     '!**/*.test.js',

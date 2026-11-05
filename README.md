@@ -173,6 +173,19 @@ git push origin v1.0.0
 在 Actions 页面手动触发 `Release` 工作流时，只产出可下载的 Actions 产物，不创建 Release。
 `CI` 工作流在推送到 `main` / 提交 PR 时运行前端构建、Python 语法检查与桌面端语法检查。
 
+### 关于 / 检查更新
+
+页面右上角「关于」实时检查 GitHub Releases 最新版本（后端 `/api/app/update`，
+默认缓存 5 分钟）：
+
+- 打开客户端/登录后自动检查一次，此后每 6 小时检查；发现新版本时在「关于」上显示红点并弹通知。
+- 有更新时可查看更新说明与安装包信息。桌面端直接「下载并安装」：
+  macOS 下载 zip 后由主进程在退出时替换 `/Applications` 下的应用并自动重启
+  （目录不可写时回退为打开安装镜像）；Windows 下载 NSIS 安装包后静默启动安装程序。
+- 浏览器部署没有桌面安装能力，按钮改为「前往下载」打开发布页。
+- 桌面端版本号来自 `desktop/package.json`（Electron `app.getVersion()`），
+  发布新版本前请先修改该版本号并打对应 `v<version>` 标签，否则客户端不会认为有新版本。
+
 ## 已实现功能
 
 - **用户体系**：注册 / 登录 / JWT 鉴权；项目、文件、模型配置按用户完全隔离。
@@ -235,12 +248,18 @@ git push origin v1.0.0
 
 - **ReAct 智能体**：所有任务统一走「思考 → 行动 → 观察」循环。模型每轮输出一个
   JSON 动作：`run_python`（在沙箱执行代码，可用 pandas/openpyxl/matplotlib，
-  数据文件在 ./data/）或 `finish`（提交成果）。执行结果作为【观察】反馈给模型，
-  直到成果通过校验或超过最大轮次（`REACT_MAX_TURNS`，默认 10，本次本机配置为 30）。
+  数据文件在 ./data/）或 `finish`（提交成果）。执行结果作为【观察】反馈给模型。
+  **默认不设轮次上限**（`REACT_MAX_TURNS=0`），由`REACT_MAX_SECONDS`（默认 1 小时）
+  时间预算与卡死检测终止；同一代码或同一失败观察连续重复（`REACT_STUCK_REPEAT_LIMIT`）、
+  连续执行失败（`REACT_MAX_RUN_FAILURES`）才判定任务失败，不再因固定轮数提前放弃。
   长时间只执行代码不提交成果时（`REACT_STALE_FINISH_NUDGE`）与剩余轮次不足时会注入
   系统提醒；对话历史估算接近模型窗口（`REACT_CONTEXT_WINDOW_TOKENS` ×
-  `REACT_CONTEXT_COMPRESS_RATIO`）时自动压缩为【前情摘要】后继续，服务端判定超长时
-  强制压缩并重试该轮一次。
+  `REACT_CONTEXT_COMPRESS_RATIO`）时自动压缩为【前情摘要】后继续，压缩时保留最近的
+  【历史失败记录】，服务端判定超长时强制压缩并重试该轮一次。
+- **失败经验继承**：任务失败时，最近几轮的具体错误（代码执行异常、finish 校验打回）
+  会写入失败版本的 `failure_digest`；同一任务、同一指令版本下次生成时自动注入
+  “【上一次生成失败经验】”，要求模型先反思再换做法。复核模型不可用等基础设施故障
+  不会写入，避免误导。
 - **文件提交**：文字、表格可以先把完整成果 JSON 保存到沙箱 `./out/result.json`，
   再用 `finish` 的 `action_input` 提交 `{"result_file":"out/result.json"}`。
   系统直接读取文件并执行同一证据校验，不从观察日志复制成果；日志只显示最多 3000 字符的摘要。

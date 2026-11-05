@@ -60,6 +60,38 @@ def test_repeat_compaction_replaces_previous_summary():
     assert "第一版摘要" in calls[1]
 
 
+def test_failure_note_survives_compaction_without_duplication():
+    messages = make_messages(6)
+    note = "- 第3轮 run_python 执行失败：KeyError: 'q7'"
+
+    async def summarize(digest):
+        return "压缩摘要"
+
+    first = asyncio.run(context_compact.compact_messages(
+        messages, 2, summarize, pinned_note=note))
+    content = first[1]["content"]
+    assert context_compact.FAILURE_MARKER in content
+    assert "KeyError" in content
+
+    # 再次压缩时应替换旧失败记录，而不是叠加
+    extended = first + make_messages(3)[2:]
+    second = asyncio.run(context_compact.compact_messages(
+        extended, 2, summarize, pinned_note=note))
+    content = second[1]["content"]
+    assert content.count(context_compact.FAILURE_MARKER) == 1
+    assert content.count("KeyError") == 1
+
+
+def test_failure_note_omitted_when_empty():
+    messages = make_messages(6)
+
+    async def summarize(digest):
+        return "压缩摘要"
+
+    compacted = asyncio.run(context_compact.compact_messages(messages, 2, summarize))
+    assert context_compact.FAILURE_MARKER not in compacted[1]["content"]
+
+
 def test_fallback_digest_when_summarizer_fails():
     messages = make_messages(6)
 

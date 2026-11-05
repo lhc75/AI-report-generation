@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from . import storage
 from .config import ROOT_DIR, settings
 from .db import init_db
-from .routers import auth, dashboard, model_configs, projects, skills
+from .routers import app_info, auth, dashboard, model_configs, projects, skills
 from .storage import ensure_bucket
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(app_info.router)
 app.include_router(model_configs.router)
 app.include_router(projects.router)
 app.include_router(dashboard.router)

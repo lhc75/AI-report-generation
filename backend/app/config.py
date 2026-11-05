@@ -48,9 +48,13 @@ class Settings(BaseSettings):
     # 生成
     GENERATE_CONCURRENCY: int = 5  # 同时执行的生成任务上限，超出排队
     REVIEW_CONCURRENCY: int = 5  # 导出前逐模块 AI 复核的并发上限（网关不稳时可调小）
-    REACT_MAX_TURNS: int = 10  # ReAct 智能体单任务最大思考-行动轮次
-    REACT_MAX_RUN_FAILURES: int = 5  # 连续 run_python 执行失败达到此次数判定任务不可完成
+    # ReAct 智能体：默认不设轮次上限（0），由时间预算与卡死检测终止；旧配置可继续设正整数作硬上限。
+    REACT_MAX_TURNS: int = 0  # ReAct 单任务最大思考-行动轮次；0 = 不限制
+    REACT_MAX_SECONDS: float = 3600.0  # 单任务实际运行时间上限（秒），0 关闭；防止无限重试烧额度
+    REACT_MAX_RUN_FAILURES: int = 8  # 连续 run_python 执行失败达到此次数判定任务不可完成
+    REACT_STUCK_REPEAT_LIMIT: int = 3  # 同一动作与同一观察连续重复达到该次数判定卡死
     REACT_STALE_FINISH_NUDGE: int = 6  # 连续仅执行代码未提交成果达到该轮数时注入 finish 提醒
+    REACT_FAILURE_NUDGE: int = 2  # run_python 连续失败达到该次数时提示模型先分析原因再换做法
     # ReAct 上下文保护：接近模型窗口时自动压缩历史（东亚字符按 1 token 保守估计）
     REACT_CONTEXT_WINDOW_TOKENS: int = 128000  # 模型上下文窗口（token），按实际模型调整
     REACT_CONTEXT_COMPRESS_RATIO: float = 0.75  # 估算值超过窗口的该比例即触发压缩
@@ -66,6 +70,13 @@ class Settings(BaseSettings):
     SCRIPT_SANDBOX_MEMORY_MB: int = Field(default=512, gt=0)
     SCRIPT_SANDBOX_MAX_OUTPUT_BYTES: int = Field(default=10 * 1024 * 1024, gt=0)
     SCRIPT_SANDBOX_MAX_LOG_BYTES: int = Field(default=1024 * 1024, gt=0)
+
+    # 应用版本与更新（桌面端会把真实版本写入 APP_VERSION）
+    APP_VERSION: str = "0.0.0"  # 当前客户端版本；0.0.0 表示开发版
+    UPDATE_REPO: str = "lhc75/AI-report-generation"  # GitHub 仓库（owner/repo），用于检查 Release
+    UPDATE_CHECK_TIMEOUT: float = 12.0  # 访问 GitHub API 的超时时间（秒）
+    UPDATE_CACHE_SECONDS: int = 300  # 版本检查结果缓存时间，避免频繁请求触发限流
+    AI_REPORT_DESKTOP: bool = False  # 由桌面端进程写入，浏览器部署保持 False
 
     # 模型调用
     LLM_CA_BUNDLE: str = ""  # 可选 PEM CA 文件；相对路径以项目根目录为基准

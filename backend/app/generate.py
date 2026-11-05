@@ -33,6 +33,15 @@ from .skills import render_system_prompt
 
 logger = logging.getLogger(__name__)
 
+
+class ReactRunError(ValueError):
+    """ReAct 循环终止错误；携带失败过程摘要，供下一次尝试参考。"""
+
+    def __init__(self, message: str, failure_digest: str = ""):
+        super().__init__(message)
+        self.failure_digest = failure_digest
+
+
 AGENT_BY_TYPE = {"text": "write", "table": "analyze", "image": "chart"}
 # 单个模板模块可覆盖多题；最终 Word 按题拆图，预览仍需受限以控制内存。
 MAX_CHART_PANELS = 15
@@ -351,8 +360,13 @@ IMAGE_GOAL += (
 GOAL_BY_TYPE = {"text": TEXT_GOAL, "table": TABLE_GOAL, "image": IMAGE_GOAL}
 
 
-def _extra(user_prompt: str) -> str:
-    return f"\n用户补充要求：{user_prompt}\n" if user_prompt else ""
+def _extra(user_prompt: str, failure_memory: str = "") -> str:
+    parts = []
+    if failure_memory:
+        parts.append(failure_memory)
+    if user_prompt:
+        parts.append(f"用户补充要求：{user_prompt}")
+    return "\n" + "\n".join(parts) + "\n" if parts else ""
 
 
 _DSML_INVOKE_RE = re.compile(
@@ -686,10 +700,42 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
     last_action_input = ""
     last_observation = ""
     last_run_python_input = ""
+    last_failure_key = ""
     same_run_python_turns = 0
+    same_failure_turns = 0
     run_python_failures = 0
     stalled_turns = 0
     turns_since_finish = 0
+    failure_notes: list[str] = []
+    started_at = time.monotonic()
+    max_turns = max(0, int(settings.REACT_MAX_TURNS or 0))
+    max_seconds = max(0.0, float(settings.REACT_MAX_SECONDS or 0))
+
+    def _remember_failure(note: str) -> None:
+        failure_notes.append(_react_preview(note, 400))
+        del failure_notes[:-12]
+
+    def _failure_digest() -> str:
+        return "\n".join(f"- {item}" for item in failure_notes[-6:])
+
+    def _track_failure_observation(observation: str) -> None:
+        """同一失败观察连续出现（即使换了代码）同样说明卡死；成功路径不参与判定。"""
+        nonlocal last_failure_key, same_failure_turns
+        key = re.sub(r"\s+", " ", str(observation or "")).strip()
+        if key and key == last_failure_key:
+            same_failure_turns += 1
+        else:
+            last_failure_key = key
+            same_failure_turns = 1
+        if same_failure_turns >= max(2, int(settings.REACT_STUCK_REPEAT_LIMIT)):
+            raise ReactRunError(
+                f"ReAct 连续 {same_failure_turns} 轮得到相同失败观察，模型可能陷入死循环"
+                f"（最后观察：{_react_preview(observation)}）",
+                failure_digest=_failure_digest(),
+            )
+
+    def _raise(message: str) -> None:
+        raise ReactRunError(message, failure_digest=_failure_digest())
 
     async def _summarize(digest: str) -> str:
         # 复用当前任务模型；经模块级 chat_completion 调用，离线测试可拦截。
@@ -706,7 +752,9 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
 
     async def _compact(keep_turns: int) -> None:
         nonlocal messages
-        messages = await context_compact.compact_messages(messages, keep_turns, _summarize)
+        # 失败记录随摘要一起保留：压缩后再问模型时，它仍记得前面错在哪里。
+        messages = await context_compact.compact_messages(
+            messages, keep_turns, _summarize, pinned_note=_failure_digest())
 
     async def _chat() -> str:
         # 每轮请求前估算上下文；接近窗口时先压缩历史再调用模型。
@@ -721,12 +769,25 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             try:
                 return await chat_completion(cfg, messages, timeout=settings.LLM_REQUEST_TIMEOUT)
             except ChatContextOverflow:
-                raise ValueError(
+                _raise(
                     "任务上下文超出模型窗口（已自动压缩历史后仍超限）："
                     "请在 .env 调大 REACT_CONTEXT_WINDOW_TOKENS 或更换更大上下文的模型"
-                ) from None
+                )
 
-    for turn in range(1, settings.REACT_MAX_TURNS + 1):
+    def _remaining_hint_for_turn() -> str:
+        return _remaining_hint(max_turns - turn) if max_turns else ""
+
+    turn = 0
+    while True:
+        turn += 1
+        if max_turns and turn > max_turns:
+            _raise(f"ReAct 超过 {max_turns} 轮仍未完成（最后问题：{last_note[:300]}）")
+        elapsed = time.monotonic() - started_at
+        if max_seconds and elapsed > max_seconds:
+            _raise(
+                f"ReAct 已运行 {int(elapsed)} 秒（上限 {int(max_seconds)} 秒）仍未完成"
+                f"（最后问题：{last_note[:300]}）"
+            )
         reply = await _chat()
         messages.append({"role": "assistant", "content": reply})
         reply_text = reply.strip()
@@ -736,8 +797,9 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             run_python_failures = 0
             stalled_turns += 1
             last_note = "模型返回空回复（content / reasoning_content / refusal 均为空）"
+            _remember_failure(f"第{turn}轮：{last_note}")
             if stalled_turns >= 3:
-                raise ValueError(
+                _raise(
                     f"ReAct 连续 {stalled_turns} 轮没有可用回复，"
                     f"模型配置可能不兼容当前协议（最后问题：{last_note[:200]}）"
                 )
@@ -770,8 +832,9 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             )
             if reply_text:
                 last_note = f"{last_note}（回复前200字：{reply_text[:200]}）"
+            _remember_failure(f"第{turn}轮：{last_note}")
             if stalled_turns >= 3:
-                raise ValueError(
+                _raise(
                     f"ReAct 连续 {stalled_turns} 轮没有可解析动作，"
                     f"模型配置可能不兼容当前协议（最后问题：{last_note[:200]}）"
                 )
@@ -796,8 +859,8 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             else:
                 last_run_python_input = normalized_input
                 same_run_python_turns = 1
-            if same_run_python_turns >= 3:
-                raise ValueError(
+            if same_run_python_turns >= max(2, int(settings.REACT_STUCK_REPEAT_LIMIT)):
+                _raise(
                     "ReAct 连续重复 run_python，模型可能陷入探索循环"
                     f"（最后动作：run_python；代码摘要：{last_action_input}；"
                     f"最后观察：{_react_preview(last_observation)}）"
@@ -805,26 +868,41 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             if workdir is None:
                 obs = "本任务没有代码执行环境，请直接 finish。"
                 run_python_failures = 0
+                same_failure_turns = 0
+                last_failure_key = ""
             else:
                 result = await asyncio.to_thread(sandbox.run_python, inp, workdir)
                 if result["ok"]:
                     obs = result["stdout"][-3000:] or "（代码执行成功，无输出）"
                     run_python_failures = 0
+                    same_failure_turns = 0
+                    last_failure_key = ""
                 else:
                     obs = "执行失败：\n" + (result["stderr"] or result["stdout"])[-3000:]
                     run_python_failures += 1
+                    _remember_failure(
+                        f"第{turn}轮 run_python 执行失败：{_react_preview(obs, 280)}")
+                    _track_failure_observation(obs)
             turns_since_finish += 1
             stall = _stall_hint(turns_since_finish)
-            urgency = _remaining_hint(settings.REACT_MAX_TURNS - turn)
-            if stall or urgency:
-                obs = "\n".join(part for part in (obs, stall, urgency) if part)
+            urgency = _remaining_hint_for_turn()
+            failure_nudge = ""
+            if (run_python_failures >= max(2, int(settings.REACT_FAILURE_NUDGE))
+                    and settings.REACT_FAILURE_NUDGE > 0):
+                failure_nudge = (
+                    f"【系统提醒】同一做法已连续失败 {run_python_failures} 次。"
+                    "请先阅读上面的错误信息、定位原因，再换一种思路或缩小范围重试；"
+                    "不要重复相同代码，也不要靠扩大输出掩盖问题。"
+                )
+            if stall or urgency or failure_nudge:
+                obs = "\n".join(part for part in (obs, stall, failure_nudge, urgency) if part)
             last_observation = obs
             last_note = (
                 f"最后动作：run_python；代码摘要：{last_action_input}；"
                 f"观察：{_react_preview(obs)}"
             )
             if run_python_failures >= settings.REACT_MAX_RUN_FAILURES:
-                raise ValueError(
+                _raise(
                     f"ReAct 连续 {run_python_failures} 次 run_python 执行失败，"
                     f"模型可能无法完成当前任务（{last_note[:300]}）"
                 )
@@ -844,18 +922,47 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
                 return normalized
             logger.info("react finish rejected at turn %s: %s", turn, str(note)[:300])
             last_note = f"最后动作：finish；校验问题：{note}；成果摘要：{last_action_input}"
+            _remember_failure(f"第{turn}轮 finish 被拒：{_react_preview(note, 300)}")
+            _track_failure_observation(f"成果未通过校验：{note}")
             obs = f"成果未通过校验：{note}。请修正后重新 finish。"
-            urgency = _remaining_hint(settings.REACT_MAX_TURNS - turn)
+            urgency = _remaining_hint_for_turn()
             if urgency:
                 obs = f"{obs}\n{urgency}"
             messages.append({"role": "user", "content": f"【观察】{obs}"})
             continue
         same_run_python_turns = 0
         run_python_failures = 0
+        same_failure_turns = 0
+        last_failure_key = ""
         last_note = f"最后动作：{last_action}；动作输入摘要：{last_action_input}"
         messages.append({"role": "user", "content": f"【观察】未知动作“{act}”，只能用 run_python 或 finish。"})
-    final_note = last_note or "模型在整个 ReAct 过程中没有返回可用内容"
-    raise ValueError(f"ReAct 超过 {settings.REACT_MAX_TURNS} 轮仍未完成（最后问题：{final_note[:300]}）")
+
+
+def _previous_failure_memory(db: Session, task: ChapterTask) -> str:
+    """读取同一任务上一次失败的过程摘要，注入下一次生成目标。
+
+    只采用指令未变化（instruction_revision 相同）且带过程摘要的失败版本；
+    这类摘要仅来自 ReAct 循环本身的问题（校验打回、代码执行失败），
+    复核模型不可用等基础设施故障不会写入，避免误导下一次尝试。
+    """
+    row = db.scalars(
+        select(ModuleContent)
+        .where(ModuleContent.chapter_task_id == task.id,
+               ModuleContent.status == "failed",
+               ModuleContent.instruction_revision == task.instruction_revision,
+               ModuleContent.failure_digest != "")
+        .order_by(ModuleContent.version.desc())
+    ).first()
+    if row is None or not (row.failure_digest or "").strip():
+        return ""
+    lines = [
+        "【上一次生成失败经验（同一任务，指令未变）】",
+        "下面是上一轮尝试中实际发生的失败，请先对照检查、避免重复同样做法：",
+        row.failure_digest.strip()[:3000],
+        "请先反思这些失败的原因（数据口径、代码写法、成果结构等），再决定新的做法；"
+        "不要原样重复失败的代码或提交同样的成果。",
+    ]
+    return "\n".join(lines)
 
 
 def _next_version(db: Session, task_id: int) -> int:
@@ -878,6 +985,7 @@ def _save_content(
     review_json: str = "{}",
     status: str = "ok",
     error_msg: str = "",
+    failure_digest: str = "",
 ) -> ModuleContent:
     db.scalar(select(ChapterTask).where(ChapterTask.id == task.id).with_for_update())
     project = db.get(Project, task.project_id)
@@ -897,6 +1005,7 @@ def _save_content(
         prompt=prompt,
         status=status,
         error_msg=error_msg,
+        failure_digest=failure_digest,
         is_current=status == "ok",
     )
     db.add(row)
@@ -1297,8 +1406,9 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
         source_context = related_task_source_context(db, task)
         references, data_summary = build_materials(db, project)
         workdir, data_names = _prepare_workdir(db, project, task, run_token)
+        failure_memory = _previous_failure_memory(db, task)
         goal = (GOAL_BY_TYPE[task.task_type]
-                .replace("{extra}", _extra(user_prompt)).replace("{path}", path)
+                .replace("{extra}", _extra(user_prompt, failure_memory)).replace("{path}", path)
                 .replace("{instruction}", task.instruction + source_context)
                 .replace("{data_files}", "、".join(data_names) or "（无）")
                 .replace("{references}", references).replace("{data_summary}", data_summary))
@@ -1375,7 +1485,8 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
             raise RuntimeError("任务已失效") from exc
         row = _save_content(db, task, task.task_type, "", "", user_prompt,
                             agent_type, model_name, int(time.time() - started), status="failed",
-                            error_msg=f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"[:500])
+                            error_msg=f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"[:500],
+                            failure_digest=(getattr(exc, "failure_digest", "") or "")[:6000])
         task.status = "failed"
         db.commit()
         return row

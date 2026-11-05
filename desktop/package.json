@@ -1,6 +1,6 @@
 {
   "name": "ai-report-desktop",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "AI 报告生成 - Electron 桌面端",
   "appDisplayName": "AI报告生成",
   "main": "main.js",

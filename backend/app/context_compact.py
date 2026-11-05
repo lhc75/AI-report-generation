@@ -16,6 +16,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 SUMMARY_MARKER = "【前情摘要（系统自动压缩）】"
+FAILURE_MARKER = "【历史失败记录（系统维护，勿重复同样错误）】"
 _SUMMARY_TIP = "（此段由系统自动压缩生成；关键数字以数据文件与 out/ 下的成果文件为准）"
 
 # 摘要请求的固定标识：离线测试的假模型靠它识别压缩调用。
@@ -90,12 +91,20 @@ def _split_summary(content: str) -> tuple[str, str]:
     return content[:index].rstrip(), content[index:]
 
 
+def _strip_failure_block(text: str) -> str:
+    """去掉上一轮压缩追加的失败记录，避免多轮压缩后重复堆叠。"""
+    index = text.find(FAILURE_MARKER)
+    return text[:index].rstrip() if index != -1 else text
+
+
 async def compact_messages(messages: list[dict], keep_turns: int, summarize,
-                           max_summary_chars: int = 1500) -> list[dict]:
+                           max_summary_chars: int = 1500,
+                           pinned_note: str = "") -> list[dict]:
     """压缩中间轮次；无需压缩（中间为空）时原样返回。
 
     summarize: async (transcript: str) -> str。抛出异常或返回空时自动降级为
     机械摘要，保证压缩本身永不打断任务。
+    pinned_note: 必须始终可见的短文本（当前失败记录），压缩后附在摘要末尾。
     """
     keep = max(0, int(keep_turns))
     tail_start = len(messages) - keep * 2
@@ -103,6 +112,7 @@ async def compact_messages(messages: list[dict], keep_turns: int, summarize,
         return messages
     head, middle, tail = messages[:2], messages[2:tail_start], messages[tail_start:]
     goal, previous = _split_summary(str(head[1].get("content") or ""))
+    previous = _strip_failure_block(previous)
     digest = build_digest(middle)
     if previous:
         digest = f"{previous}\n{digest}".strip()
@@ -115,10 +125,11 @@ async def compact_messages(messages: list[dict], keep_turns: int, summarize,
     if not recap:
         recap = _preview(digest, 3000)
     recap = _preview(recap, max_summary_chars)
-    merged = {
-        "role": "user",
-        "content": f"{goal}\n\n{SUMMARY_MARKER}\n{_SUMMARY_TIP}\n{recap}",
-    }
+    content = f"{goal}\n\n{SUMMARY_MARKER}\n{_SUMMARY_TIP}\n{recap}"
+    pinned = _preview(pinned_note, 2000).strip()
+    if pinned:
+        content = f"{content}\n\n{FAILURE_MARKER}\n{pinned}"
+    merged = {"role": "user", "content": content}
     compacted = [head[0], merged, *tail]
     logger.info(
         "react context compacted: ~%s -> ~%s tokens (kept last %s messages)",
