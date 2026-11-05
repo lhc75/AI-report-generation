@@ -58,7 +58,7 @@ def chart_caption_repeats_title(title: str, caption: str) -> bool:
 
 
 _FIGURE_NUMBER_RE = re.compile(r"图\s*\d+[\.\-]\d+")
-_LEADING_FIGURE_RE = re.compile(r"^\s*(图\s*\d+(?:\s*[\.\-]\s*\d+)+)\s*")
+_LEADING_FIGURE_RE = re.compile(r"^\s*(图\s*\d+(?:\s*[\.\-]\s*\d+)*)\s*")
 
 
 def dedupe_leading_figure_number(value: str) -> str:

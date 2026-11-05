@@ -24,7 +24,7 @@ from unicodedata import east_asian_width
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import context_compact, sandbox, storage, template_parse, operations
+from . import context_compact, report_numbering, sandbox, storage, template_parse, operations
 from .config import settings
 from .llm import chat_completion, ChatContextOverflow
 from .models import ChapterTask, GenerationRecord, ModelConfig, ModuleContent, Project, ProjectFile
@@ -335,7 +335,7 @@ IMAGE_GOAL = (
     "4. 中文字体：plt.rcParams['font.sans-serif'] = ['Hiragino Sans GB', 'PingFang SC', "
     "'Arial Unicode MS', 'SimHei']，并设置 plt.rcParams['axes.unicode_minus'] = False；\n"
     "5. 图表必须有标题与坐标轴或图例，数值标签尽量标注；\n"
-    "6. 顶层 caption 保留任务指令给出的完整图题（含图号，如“图2.2-3 …”），多子图共用"
+    "6. 顶层 caption 写完整图题，不要写图号（图号由系统导出时统一生成），多子图共用"
     "同一顶层图题、各自标题写在子图 title；不需要编写 note/source 注记；\n"
     "6.1 任务指令里的题号（如“教育主管部门Q7”“教师Q12”）只是内部定位写法：图表标题、"
     "子图标题与 labels 等一切图内文字必须改写为中文“第X题”（如“教育主管部门第七题”），"
@@ -1468,16 +1468,19 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
                 return ok, note, normalized
             # 清洗先行，保证"被复核的内容"就是"最终保存的内容"。
             if task.task_type == "text":
-                review_content = sanitize_prose(json.loads(normalized)["content"])
+                review_content = report_numbering.normalize_question_numbers(
+                    sanitize_prose(json.loads(normalized)["content"]))
                 normalized = json.dumps({"content": review_content}, ensure_ascii=False)
             elif task.task_type == "table":
-                normalized = sanitize_table_json(normalized)
+                normalized = report_numbering.normalize_content_questions(
+                    sanitize_table_json(normalized), "table")
                 review_content = normalized
             else:
                 chart_path = sandbox.output_path(directory, "out/chart_data.json")
                 chart_data = sanitize_chart_data(
                     json.loads(chart_path.read_text(encoding="utf-8")))
-                normalized = json.dumps(chart_data, ensure_ascii=False)
+                normalized = report_numbering.normalize_content_questions(
+                    json.dumps(chart_data, ensure_ascii=False), "image")
                 chart_path.write_text(normalized, encoding="utf-8")
                 review_content = normalized
             result = await review_engine.review_generated_content(

@@ -471,7 +471,7 @@ def test_text_repair_cleans_chart_note_and_keeps_json_valid(project, db, monkeyp
     current = review._current_contents(db, item.id)[image_task.id]
     payload = json.loads(current.content)
     assert payload["note"] == "单选题，选项占比"
-    assert current.version == 2
+    assert current.version >= 3  # 规范化生成新版本，修复再生成一版
 
 
 def test_warning_only_passes_with_warnings(project, db, monkeypatch):

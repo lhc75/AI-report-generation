@@ -57,8 +57,9 @@ def test_mock_model_workflow_with_native_docx_render(project, db, monkeypatch, t
 
     text = ("支持者有2人，占66.7%。调查结果显示，多数受访者持支持态度。"
             "后续工作可结合不同意见进一步了解受访者的具体需求，并据此安排沟通与反馈。")
-    table = {"title": "各选项人数表", "columns": ["选项", "人数"], "rows": [["支持", 2], ["反对", 1]]}
-    chart = {"title": "态度人数", "labels": ["支持", "反对"], "values": [2, 1],
+    table = {"title": "表1 各选项人数表", "columns": ["选项", "人数"], "rows": [["支持", 2], ["反对", 1]]}
+    chart = {"title": "态度人数", "caption": "图1 态度人数",
+             "labels": ["支持", "反对"], "values": [2, 1],
              "metric": "count", "counts": [2, 1]}
     chart_code = (
         "import pandas as pd, json, random\n"

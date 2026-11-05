@@ -23,7 +23,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import generate, operations, sandbox, storage
+from . import generate, operations, report_numbering, sandbox, storage
 from .config import settings
 from .db import SessionLocal
 from .models import ChapterTask, ModuleContent, Project, ProjectFile
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 SEVERITIES = {"error", "warning"}
 
 # 审核协议版本：判定口径或输出规则变化时递增，旧版本缓存自动失效并重新复核。
-REVIEW_PROTOCOL_VERSION = 7
+REVIEW_PROTOCOL_VERSION = 8
 
 
 class ReviewError(Exception):
@@ -65,9 +65,8 @@ FINAL_REVIEW_OUTPUT_GUIDE = (
     "能用一处唯一文本片段直接改好的冲突（如某模块里的单个数字、称谓或措辞需要替换），"
     "必须给出 repairs（old 必须在目标模块中唯一出现；表格用 table_cell 定位单元格），"
     "不要为这种可精确定位的问题要求整模块重算；仅当无法用文本片段修好时才留空 repairs。\n"
-    "图号、表号、称谓与交叉引用这类可用唯一文本片段直接修正的不一致（例如把图题或正文里的"
-    "“图2.3-1”改为全稿统一编号方案中的编号），必须逐模块给出 repairs，并在 message 中说明"
-    "全稿统一编号方案；不要为这类可直接修改的问题要求重新生成。\n"
+    "图号、表号、题号数字格式与 caption 编号由系统在导出前统一生成和规范化，"
+    "不要把它们作为 error 或 warning 报出，也不要给出这类 repairs；审核只关注内容与数据语义。\n"
 )
 
 _REVIEW_COMMON_NOTES = (
@@ -85,9 +84,10 @@ _REVIEW_COMMON_NOTES = (
     "5. 成文里出现传输格式残留（如 {\"content\":…} JSON 外壳、content: 字段名）"
     "属于未清理的半成品，应作为 error 报出；无法用一句话修好时不要给 repairs，"
     "直接要求重新生成该模块。\n"
-    "6. 成文（正文、表格、图题与图内文字、表注）引用问卷题目必须用中文“第X题”"
-    "（如“第一题”“第十二题”）；出现 Q1、Q2、qN 等字母编码属于内部写法，应作为 error 报出"
-    "并优先给出可直接应用的 repairs（把每个出现处替换为“第X题”：表格单元格用 table_cell，"
+    "6. 成文（正文、表格、图题与图内文字、表注）引用问卷题目必须用中文题号（如“第X题”）；"
+    "数字题号的写法由系统导出前统一转换（“第11题”会自动变为“第十一题”），"
+    "不要因为数字/中文写法差异报 error；但 Q1、Q2、qN 等字母编码属于内部写法，"
+    "应作为 error 报出并优先给出可直接应用的 repairs（表格单元格用 table_cell，"
     "正文或图内文字用 text；old 必须是唯一可定位的片段），确无法唯一匹配时才要求重新生成；"
     "题号对照表的说明不得再写“沿用原问卷编号”。\n"
     "7. 成文不得出现资料完备性或对码过程声明（如“未取得正式施测编码表”"
@@ -110,9 +110,8 @@ MODULE_REVIEW_GOAL = (
     "图表排版是否可读（类别密度、标签长度、分组呈现、标注密度）；\n"
     "4. 是否存在明显的编造、与数据矛盾或自相矛盾的表述；\n"
     "5. 方法说明是否简明、不重复堆砌。\n"
-    "6. 图表成果的顶层 caption 必须是“图号 + 指令中的完整图题”（如“图2.2-3 …”；"
-    "多子图共用同一图题，子图标题放各自 title）；缺失时用 text 修复补齐顶层 caption，"
-    "不要改动数据字段；图内标题（title）不要包含图号，图号只放在顶层 caption。\n"
+    "6. 图表成果的顶层 caption 用完整的图题描述本图内容；图号由系统导出时自动生成，"
+    "缺失图号不算问题，也不要要求模型补图号；子图标题只写对象与题目，不要写图号。\n"
     "7. 同一句或同一组并列的多个数字必须逐项复算且口径一致（例如同一句按“A+B”合并，"
     "则每个群体都按“A+B”）；出现组内口径混用（个别项只取 A、其余取 A+B）时按 error 报出，"
     "并给出应改成的一致口径数字。\n"
@@ -424,6 +423,51 @@ def _copy_data_files(db: Session, project: Project, workdir: Path) -> None:
     _write_data_files(workdir, _load_data_files(db, project))
 
 
+_CHART_SCHEMA_TERMS = re.compile(r"\blabels\b|\bcaption\b|图内标题|子图标题", re.IGNORECASE)
+_NUMBERING_TERMS = re.compile(r"图号|表号|题号|图内标题|子图标题|\blabels\b|\bcaption\b",
+                              re.IGNORECASE)
+_DATA_TERMS = re.compile(r"数字|数值|数据|百分比|占比|频次|计数|分母|样本|复算|互换|"
+                         r"不一致|不符|错误|缺失|遗漏", re.IGNORECASE)
+_VALUE_TERMS = re.compile(r"数值|数据|百分比|占比|频次|计数|分母|样本|复算|互换|"
+                          r"不一致|不符|错误|缺失|遗漏", re.IGNORECASE)
+
+
+def _is_numbering_only(message: str) -> bool:
+    text = str(message or "")
+    return bool(_NUMBERING_TERMS.search(text)) and not _VALUE_TERMS.search(text)
+
+
+def _sanitize_review_issues(issues: list[dict[str, Any]],
+                            tasks_by_id: dict[int, ChapterTask],
+                            default_task: ChapterTask | None = None) -> list[dict[str, Any]]:
+    """把系统负责的编号/格式问题和明显错位的指认降级为提示。
+
+    编号由导出前的确定性层统一处理；审核模型的职责只有内容与数据语义。
+    """
+    for item in issues:
+        if item.get("severity") != "error":
+            continue
+        message = str(item.get("message") or "")
+        if _is_numbering_only(message):
+            item["message"] = message + "（编号/题号格式由系统统一处理，已转为提示）"
+            item["severity"] = "warning"
+            logger.info("审核编号类问题转为提示：%s", message[:120])
+            continue
+        ids = item.get("task_ids")
+        if not ids and item.get("task_id") is not None:
+            ids = [item["task_id"]]
+        targets = [tasks_by_id.get(task_id) for task_id in (ids or [])]
+        targets = [task for task in targets if task is not None]
+        if not targets and default_task is not None:
+            targets = [default_task]
+        if (_CHART_SCHEMA_TERMS.search(message) and targets
+                and all(task.task_type != "image" for task in targets)):
+            item["message"] = message + "（审核指认与模块类型不符，已转为提示）"
+            item["severity"] = "warning"
+            logger.warning("审核指认与模块类型不符，已降级：%s", message[:120])
+    return issues
+
+
 async def _module_review(db: Session, cfg, project: Project, task: ChapterTask,
                          row: ModuleContent, location: str, references: str,
                          data_summary: str, run_token: str | None, *,
@@ -453,7 +497,10 @@ async def _module_review(db: Session, cfg, project: Project, task: ChapterTask,
                 db, cfg, MODULE_REVIEW_GOAL, workdir, "review",
                 finish_validator=_review_finish_validator,
             )
-            return json.loads(raw)
+            result = json.loads(raw)
+            result["issues"] = _sanitize_review_issues(
+                list(result.get("issues") or []), {task.id: task}, default_task=task)
+            return result
         except Exception as exc:
             last_error = exc
             logger.warning("模块 %s 复核第 %s/%s 次失败：%s",
@@ -492,7 +539,11 @@ async def _final_review(db: Session, cfg, project: Project, tasks: list[ChapterT
     for _attempt in range(3):
         raw = await generate.chat_completion(cfg, messages, timeout=settings.LLM_REQUEST_TIMEOUT)
         try:
-            return _normalize_review_payload(raw, module_ids=module_ids)
+            result = _normalize_review_payload(raw, module_ids=module_ids)
+            result["issues"] = _sanitize_review_issues(
+                list(result.get("issues") or []),
+                {task.id: task for task in tasks})
+            return result
         except ReviewError as exc:
             last_error = str(exc)
             messages.append({"role": "assistant", "content": raw})
@@ -679,18 +730,30 @@ def _apply_repairs(db: Session, project: Project, repairs: list[dict[str, Any]],
 
 
 def _issue_signature(issues: list[dict[str, Any]]) -> str:
-    """把 error 集归一成签名：同一批问题连续多轮不变时停止自动修复。"""
-    parts: list[str] = []
+    """把 error 集归一成“任务 + 问题类别”的签名，避免措辞变化绕过无进展检测。"""
+    parts: set[str] = set()
     for item in issues:
         if item.get("severity") != "error":
             continue
         ids = item.get("task_ids")
         if not ids and item.get("task_id") is not None:
             ids = [item["task_id"]]
-        parts.append(
-            f"{','.join(str(value) for value in sorted(ids or []))}:"
-            f"{str(item.get('message') or '')[:200]}")
+        key = ",".join(str(value) for value in sorted(ids or []))
+        parts.add(f"{key}:{_issue_category(str(item.get('message') or ''))}")
     return "\n".join(sorted(parts))
+
+
+def _issue_category(message: str) -> str:
+    text = str(message or "")
+    if _NUMBERING_TERMS.search(text):
+        return "numbering"
+    if re.search(r"缺失|缺少|遗漏|为空|未生成|未提供", text):
+        return "missing"
+    if re.search(r"冲突|矛盾|重复|不一致|不符", text):
+        return "conflict"
+    if _DATA_TERMS.search(text):
+        return "data"
+    return "other"
 
 
 def _review_stop_issue(reason: str, detail: str) -> dict[str, Any]:
@@ -704,28 +767,53 @@ def _review_stop_issue(reason: str, detail: str) -> dict[str, Any]:
 def _normalize_chart_captions(db: Session, project: Project,
                               tasks: list[ChapterTask],
                               run_token: str | None) -> None:
-    """导出前确定性折叠重复图号，避免这类问题占用 AI 修复轮次。"""
+    """导出前确定性编号与规范化：图号、表号、题号与引用。
+
+    模型只写内容；编号和格式由系统接管，避免重复图号、阿拉伯题号等
+    结构性问题反复进入 AI 审核与重生成。
+    """
     current = _current_contents(db, project.id)
     by_id = {task.id: task for task in tasks}
-    changed = False
+    figure_numbers = report_numbering.figure_number_map(tasks)
+    table_numbers = report_numbering.table_number_map(tasks)
+
+    figure_pairs: dict[str, set[str]] = {}
+    table_pairs: dict[str, set[str]] = {}
     for task_id, row in current.items():
-        if row.content_type != "image":
-            continue
-        try:
-            data = json.loads(row.content)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        fixed = generate.sanitize_chart_data(data)
-        if fixed == data:
-            continue
         task = by_id.get(task_id)
         if task is None:
             continue
+        if task.task_type == "image" and task_id in figure_numbers:
+            number = figure_numbers[task_id]
+            for old in report_numbering.collect_figure_numbers(row.content):
+                figure_pairs.setdefault(old, set()).add(number)
+        elif task.task_type == "table" and task_id in table_numbers:
+            number = f"表{table_numbers[task_id]}"
+            for old in report_numbering.collect_table_number(row.content):
+                table_pairs.setdefault(old, set()).add(number)
+    figure_refs = report_numbering.unique_reference_map(figure_pairs)
+    table_refs = report_numbering.unique_reference_map(table_pairs)
+    table_refs = {old: new for old, new in table_refs.items() if old != new}
+
+    changed = False
+    for task_id, row in current.items():
+        task = by_id.get(task_id)
+        if task is None:
+            continue
+        normalized, _old = report_numbering.normalize_row_content(
+            row.content, task.task_type,
+            figure_number=figure_numbers.get(task_id),
+            table_number=table_numbers.get(task_id),
+            figure_refs=figure_refs,
+            table_refs=table_refs,
+        )
+        if normalized == row.content:
+            continue
+        logger.info("导出前规范化：任务 %s（%s）内容已更新", task_id, task.task_type)
         operations.ensure_run(db, project.id, run_token)
         generate._save_content(
-            db, task, row.content_type,
-            json.dumps(fixed, ensure_ascii=False), row.image_path,
-            "导出审核自动修正（重复图号）", "review", "", 0)
+            db, task, task.task_type, normalized, row.image_path,
+            "导出前确定性规范化（图号/表号/题号）", "review", "", 0)
         changed = True
     if changed:
         db.commit()
@@ -758,6 +846,8 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
     budget = max(0.0, float(settings.REVIEW_MAX_SECONDS or 0))
     deadline = time.monotonic() + budget if budget > 0 else None
     history: dict[int, list[str]] = {}
+    task_regen_counts: dict[int, int] = {}
+    regen_cap = max(1, int(settings.REVIEW_MAX_TASK_REGENS or 4))
     last_signature = ""
     stalled_rounds = 0
     round_no = 0
@@ -834,6 +924,16 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
         # 无可用定向修正的模块：带着审核意见自动重新生成（等价于人工点“重写”）。
         regenerated: set[int] = set()
         unresolved_tasks = [task for task in tasks if task.id in target_ids - applied]
+        capped_tasks = [task for task in unresolved_tasks
+                        if task_regen_counts.get(task.id, 0) >= regen_cap]
+        unresolved_tasks = [task for task in unresolved_tasks
+                            if task_regen_counts.get(task.id, 0) < regen_cap]
+        for task in capped_tasks:
+            message = f"该模块已自动重生成 {regen_cap} 次仍未通过，已停止自动重试，请人工处理"
+            results[task.id] = {"status": "issues", "repairs": [], "issues": [{
+                "severity": "error", "message": message}]}
+            errors.append(_error_entry(task, locations[task.id], message))
+            logger.warning("模块 %s 达到重生成上限 %s，停止自动重试", task.id, regen_cap)
         feedback_map: dict[int, str] = {}
         for task in unresolved_tasks:
             messages = [item["message"] for item in results[task.id]["issues"]
@@ -856,6 +956,8 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
             history.setdefault(task.id, []).extend(messages[:6])
             logger.info("模块 %s 按审核意见重新生成：%s", task.id, feedback_map[task.id][:160])
         if unresolved_tasks:
+            for task in unresolved_tasks:
+                task_regen_counts[task.id] = task_regen_counts.get(task.id, 0) + 1
             fix_done, regenerated = await _regenerate_tasks_parallel(
                 project.id, unresolved_tasks, feedback_map, results, run_token,
                 fix_done, fix_total)
@@ -948,6 +1050,16 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
                                        label="定向修正/重新生成",
                                        done=fix_done, total=fix_total)
         regen_tasks = [task for task in tasks if task.id in target_ids - applied_final]
+        capped_final = [task for task in regen_tasks
+                        if task_regen_counts.get(task.id, 0) >= regen_cap]
+        regen_tasks = [task for task in regen_tasks
+                       if task_regen_counts.get(task.id, 0) < regen_cap]
+        for task in capped_final:
+            final_errors.append({
+                "severity": "error", "task_id": task.id, "task_ids": [task.id],
+                "title": "自动修复已停止",
+                "message": f"该模块已自动重生成 {regen_cap} 次仍未通过，请人工处理"})
+            logger.warning("整稿复核：模块 %s 达到重生成上限 %s", task.id, regen_cap)
         feedback_map: dict[int, str] = {}
         for task in regen_tasks:
             messages = by_task.get(task.id, [])
@@ -971,6 +1083,8 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
             logger.info("整稿复核指认模块 %s，按意见重新生成", task.id)
         regenerated_final: set[int] = set()
         if regen_tasks:
+            for task in regen_tasks:
+                task_regen_counts[task.id] = task_regen_counts.get(task.id, 0) + 1
             fix_done, regenerated_final = await _regenerate_tasks_parallel(
                 project.id, regen_tasks, feedback_map, results, run_token,
                 fix_done, fix_total)

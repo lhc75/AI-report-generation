@@ -27,7 +27,7 @@ def test_final_review_protocol_offers_direct_repairs():
     guide = review.FINAL_REVIEW_OUTPUT_GUIDE
     assert "必须给出 repairs" in guide
     assert "唯一文本片段" in guide
-    assert "全稿统一编号方案" in guide
+    assert "由系统在导出前统一生成和规范化" in guide
 
 
 def test_module_review_requires_consistent_metric_scope():
