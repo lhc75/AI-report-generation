@@ -183,7 +183,7 @@ def test_failure_digest_is_carried_by_run_error(monkeypatch):
     assert "校验失败" in info.value.failure_digest
 
 
-def test_repeated_failure_observation_trips_breaker(monkeypatch, tmp_path):
+def test_repeated_failure_observation_nudges_then_trips(monkeypatch, tmp_path):
     state = {"n": 0}
 
     async def fake_chat(cfg, messages, **kwargs):
@@ -195,6 +195,31 @@ def test_repeated_failure_observation_trips_breaker(monkeypatch, tmp_path):
 
     monkeypatch.setattr(generate, "chat_completion", fake_chat)
     monkeypatch.setattr(generate.sandbox, "run_python", failing_run)
+    monkeypatch.setattr(generate.settings, "REACT_MAX_RUN_FAILURES", 99)
     with pytest.raises(generate.ReactRunError, match="相同失败观察"):
         asyncio.run(generate.react_run(None, make_cfg(), "目标", tmp_path, "text",
                                        finish_validator=ok_validator))
+    # 中止前必须先给过“换做法”的提醒
+    assert state["n"] > generate.settings.REACT_STUCK_REPEAT_LIMIT * 2
+
+
+def test_repeated_code_gets_nudge_and_can_recover(monkeypatch):
+    """重复代码不再立即中止：提醒后模型换做法仍可完成任务。"""
+    codes = ["print(1)", "print(1)", "print(1)"]
+    state = {"n": 0}
+    seen = []
+
+    async def fake_chat(cfg, messages, **kwargs):
+        seen.append(str(messages[-1].get("content", "")))
+        state["n"] += 1
+        if state["n"] <= 3:
+            return action("run_python", codes[state["n"] - 1])
+        if state["n"] == 4:
+            return action("run_python", "print(2)")
+        return action("finish", "完成")
+
+    result = run_react(fake_chat, monkeypatch, REACT_MAX_TURNS=0,
+                       REACT_STALE_FINISH_NUDGE=99)
+    assert result == "完成"
+    assert any("完全相同的代码" in text for text in seen)
+

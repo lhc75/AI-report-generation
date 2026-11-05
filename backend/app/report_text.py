@@ -58,6 +58,30 @@ def chart_caption_repeats_title(title: str, caption: str) -> bool:
 
 
 _FIGURE_NUMBER_RE = re.compile(r"图\s*\d+[\.\-]\d+")
+_LEADING_FIGURE_RE = re.compile(r"^\s*(图\s*\d+(?:\s*[\.\-]\s*\d+)+)\s*")
+
+
+def dedupe_leading_figure_number(value: str) -> str:
+    """Collapse an accidentally repeated leading figure number in a caption.
+
+    ``图2.7-1 图2.7-1 主题分布`` → ``图2.7-1 主题分布``。只处理开头连续重复的
+    同一图号；正文中的其他图号与文字保持原样。
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    match = _LEADING_FIGURE_RE.match(text)
+    if not match:
+        return value
+    token = re.sub(r"\s+", "", match.group(1))
+    rest = text[match.end():].lstrip(" ：:、,，")
+    while True:
+        extra = _LEADING_FIGURE_RE.match(rest)
+        if not extra or re.sub(r"\s+", "", extra.group(1)) != token:
+            break
+        rest = rest[extra.end():].lstrip(" ：:、,，")
+    return f"{match.group(1).strip()} {rest}".strip()
+
 
 
 def caption_droppable_as_repeat(title: str, caption: str) -> bool:

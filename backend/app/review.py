@@ -439,7 +439,8 @@ async def _module_review(db: Session, cfg, project: Project, task: ChapterTask,
         "参考资料摘要": _trim(references, 3000),
     }
     last_error: Exception | None = None
-    for _attempt in range(2):
+    attempts = max(1, int(settings.REVIEW_MODULE_ATTEMPTS or 3))
+    for _attempt in range(attempts):
         try:
             workdir = sandbox.fresh_workdir(project.id, -(1000 + task.id), run_token)
             if data_files is None:
@@ -455,7 +456,8 @@ async def _module_review(db: Session, cfg, project: Project, task: ChapterTask,
             return json.loads(raw)
         except Exception as exc:
             last_error = exc
-            logger.warning("模块 %s 复核失败，重试一次：%s", task.id, exc)
+            logger.warning("模块 %s 复核第 %s/%s 次失败：%s",
+                           task.id, _attempt + 1, attempts, exc)
     raise last_error
 
 
@@ -676,7 +678,60 @@ def _apply_repairs(db: Session, project: Project, repairs: list[dict[str, Any]],
     return applied
 
 
-async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
+def _issue_signature(issues: list[dict[str, Any]]) -> str:
+    """把 error 集归一成签名：同一批问题连续多轮不变时停止自动修复。"""
+    parts: list[str] = []
+    for item in issues:
+        if item.get("severity") != "error":
+            continue
+        ids = item.get("task_ids")
+        if not ids and item.get("task_id") is not None:
+            ids = [item["task_id"]]
+        parts.append(
+            f"{','.join(str(value) for value in sorted(ids or []))}:"
+            f"{str(item.get('message') or '')[:200]}")
+    return "\n".join(sorted(parts))
+
+
+def _review_stop_issue(reason: str, detail: str) -> dict[str, Any]:
+    return {
+        "severity": "error",
+        "title": "自动修复已停止",
+        "message": f"{reason}：{detail}。请根据上面的问题手动修改后重新导出。",
+    }
+
+
+def _normalize_chart_captions(db: Session, project: Project,
+                              tasks: list[ChapterTask],
+                              run_token: str | None) -> None:
+    """导出前确定性折叠重复图号，避免这类问题占用 AI 修复轮次。"""
+    current = _current_contents(db, project.id)
+    by_id = {task.id: task for task in tasks}
+    changed = False
+    for task_id, row in current.items():
+        if row.content_type != "image":
+            continue
+        try:
+            data = json.loads(row.content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        fixed = generate.sanitize_chart_data(data)
+        if fixed == data:
+            continue
+        task = by_id.get(task_id)
+        if task is None:
+            continue
+        operations.ensure_run(db, project.id, run_token)
+        generate._save_content(
+            db, task, row.content_type,
+            json.dumps(fixed, ensure_ascii=False), row.image_path,
+            "导出审核自动修正（重复图号）", "review", "", 0)
+        changed = True
+    if changed:
+        db.commit()
+
+
+async def review_and_repair(db: Session, project: Project, max_rounds: int | None = None,
                             run_token: str | None = None) -> dict[str, Any]:
     """导出前审核：逐模块 AI 复核 → 自动修正 → 复评 → 整稿复核 → 分级放行。
 
@@ -694,10 +749,19 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
         .order_by(ChapterTask.sort)
     ).all()
     locations = {task.id: generate.document_location(db, task) for task in tasks}
+    _normalize_chart_captions(db, project, tasks, run_token)
     results: dict[int, dict[str, Any]] = {}
     data_files = _load_data_files(db, project)
     total = len(tasks)
-    for round_no in range(max_rounds + 1):
+    max_rounds = (int(settings.REVIEW_MAX_ROUNDS or 0)
+                  if max_rounds is None else max(0, int(max_rounds)))
+    budget = max(0.0, float(settings.REVIEW_MAX_SECONDS or 0))
+    deadline = time.monotonic() + budget if budget > 0 else None
+    history: dict[int, list[str]] = {}
+    last_signature = ""
+    stalled_rounds = 0
+    round_no = 0
+    while True:
         current = _current_contents(db, project.id)
         done_count = 0
         pending: list[ChapterTask] = []
@@ -732,9 +796,27 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
         ]
         if not errors:
             break
-        if round_no >= max_rounds:
+        for task in tasks:
+            if not any(item["severity"] == "error"
+                       for item in results.get(task.id, {}).get("issues", [])):
+                history.pop(task.id, None)
+        if max_rounds and round_no >= max_rounds:
             db.commit()
-            return {"ok": False, "issues": errors}
+            return {"ok": False, "issues": errors + [
+                _review_stop_issue("轮次上限", f"已完成 {round_no} 轮自动修复")]}
+        if deadline is not None and time.monotonic() > deadline:
+            db.commit()
+            return {"ok": False, "issues": errors + [
+                _review_stop_issue("时间预算", f"审核已超过 {int(budget)} 秒")]}
+        signature = _issue_signature(errors)
+        if signature == last_signature:
+            stalled_rounds += 1
+        else:
+            last_signature, stalled_rounds = signature, 0
+        if stalled_rounds >= max(1, int(settings.REVIEW_NO_PROGRESS_LIMIT)):
+            db.commit()
+            return {"ok": False, "issues": errors + [
+                _review_stop_issue("无进展", f"连续 {stalled_rounds + 1} 轮问题没有变化")]}
         target_ids = {item["task_id"] for item in errors}
         fix_total = max(1, len(target_ids))
         operations.report_progress(project.id, run_token, phase="repair",
@@ -764,6 +846,14 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
                 "与本问题无关的图号、称谓与已核实数字保持原样，不要改动；"
                 "重新提交前逐项自检。"
             )
+            prior = list(dict.fromkeys(history.get(task.id, [])))
+            if prior:
+                feedback_map[task.id] += (
+                    "\n【前几轮已提出但未解决】" + "；".join(prior[-6:])
+                    + "。上一轮修改没有解决这些问题，不要重复同样的改法；"
+                    "请先对照 ./data 复算，核对字段、题号与选项语义的对应关系，"
+                    "再换一种处理方式。")
+            history.setdefault(task.id, []).extend(messages[:6])
             logger.info("模块 %s 按审核意见重新生成：%s", task.id, feedback_map[task.id][:160])
         if unresolved_tasks:
             fix_done, regenerated = await _regenerate_tasks_parallel(
@@ -771,9 +861,11 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
                 fix_done, fix_total)
         if not applied and not regenerated:
             db.commit()
-            return {"ok": False, "issues": errors}
+            return {"ok": False, "issues": errors + [
+                _review_stop_issue("无进展", "本轮没有可执行的修复或重生成")]}
         for task_id in applied | regenerated:
             results.pop(task_id, None)
+        round_no += 1
         db.commit()
     db.commit()
 
@@ -788,7 +880,12 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
     # 整稿复核给出的定向修复（可直接落盘的单点勘误），每轮随复核结果刷新。
     final_repairs: list[dict[str, Any]] = []
 
-    for final_round in range(6):
+    final_round = 0
+    final_history: dict[int, list[str]] = {}
+    last_final_signature = ""
+    final_stalled = 0
+    final_stop: dict[str, Any] | None = None
+    while True:
         if pending:
             final_errors, pending = pending, []
             final_repairs = []
@@ -824,7 +921,19 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
             for task_id in item["task_ids"]:
                 by_task.setdefault(task_id, []).append(item["message"])
         target_ids = set(by_task) & {task.id for task in tasks}
-        if final_round >= 5:
+        if max_rounds and final_round >= max_rounds:
+            final_stop = _review_stop_issue("轮次上限", f"整稿复核已完成 {final_round} 轮修复")
+            break
+        if deadline is not None and time.monotonic() > deadline:
+            final_stop = _review_stop_issue("时间预算", f"审核已超过 {int(budget)} 秒")
+            break
+        signature = _issue_signature(final_errors)
+        if signature == last_final_signature:
+            final_stalled += 1
+        else:
+            last_final_signature, final_stalled = signature, 0
+        if final_stalled >= max(1, int(settings.REVIEW_NO_PROGRESS_LIMIT)):
+            final_stop = _review_stop_issue("无进展", f"连续 {final_stalled + 1} 轮问题没有变化")
             break
         repair_ids = {item["task_id"] for item in final_repairs}
         fix_total = max(1, len(target_ids | repair_ids))
@@ -852,6 +961,13 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
                 "与本问题无关的图号、称谓与已核实数字保持原样，不要改动；"
                 "重新提交前逐项自检。"
             )
+            prior = list(dict.fromkeys(final_history.get(task.id, [])))
+            if prior:
+                feedback_map[task.id] += (
+                    "\n【前几轮已提出但未解决】" + "；".join(prior[-6:])
+                    + "。上一轮修改没有解决这些问题，不要重复同样的改法；"
+                    "请先复算并核对数据键，再换一种处理方式。")
+            final_history.setdefault(task.id, []).extend(messages[:4])
             logger.info("整稿复核指认模块 %s，按意见重新生成", task.id)
         regenerated_final: set[int] = set()
         if regen_tasks:
@@ -859,6 +975,7 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
                 project.id, regen_tasks, feedback_map, results, run_token,
                 fix_done, fix_total)
         if not applied_final and not regenerated_final:
+            final_stop = _review_stop_issue("无进展", "本轮没有可执行的修复或重生成")
             break
         db.commit()
         # 复评：被修复或重生成的内容重新过一遍模块级沙箱复核，新问题进入下一轮修复。
@@ -866,8 +983,10 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int = 2,
             project.id, cfg, project, tasks, locations,
             applied_final | regenerated_final, references, data_summary,
             run_token, results, data_files)
-    return {"ok": False, "issues": (final_errors + _warning_entries(tasks, locations, results)
-                                    + final_notes)}
+        final_round += 1
+    issues: list[dict[str, Any]] = ([final_stop] if final_stop else []) + final_errors
+    issues += _warning_entries(tasks, locations, results) + final_notes
+    return {"ok": False, "issues": issues}
 
 
 async def _recheck_regenerated(

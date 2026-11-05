@@ -215,12 +215,13 @@ def _verified_chart_files(workdir: Path, task: ChapterTask, content: ModuleConte
 
 def _chart_captions_for_manifest(metadata: dict) -> tuple[list[list[str]], list[str]]:
     """图下只保留编号图题：顶层 caption 作为整组图题，缺省时退回各子图 caption。"""
-    from .report_text import caption_droppable_as_repeat
+    from .report_text import caption_droppable_as_repeat, dedupe_leading_figure_number
 
     def caption_lines(item: dict) -> list[str]:
         value = item.get("caption")
         if not isinstance(value, str):
             return []
+        value = dedupe_leading_figure_number(value)
         lines = [line.strip() for line in value.splitlines() if line.strip()]
         # 带图号的图题必须保留（与图内标题相同也不视为冗余），否则图会失去编号；
         # 仅省略既无图号又与标题重复的图题。

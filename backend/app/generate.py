@@ -28,7 +28,7 @@ from . import context_compact, sandbox, storage, template_parse, operations
 from .config import settings
 from .llm import chat_completion, ChatContextOverflow
 from .models import ChapterTask, GenerationRecord, ModelConfig, ModuleContent, Project, ProjectFile
-from .report_text import chart_caption_repeats_title, formal_chart_title
+from .report_text import chart_caption_repeats_title, dedupe_leading_figure_number, formal_chart_title
 from .skills import render_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -639,6 +639,24 @@ def _finish_chart_structure(workdir, instruction: str = "") -> tuple[bool, str]:
     return True, ""
 
 
+def sanitize_chart_data(value) -> dict:
+    """确定性清理图表元数据：折叠开头重复的图号，其余字段保持原样。"""
+    if not isinstance(value, dict):
+        return value
+    data = json.loads(json.dumps(value, ensure_ascii=False))
+
+    def _fix(item) -> None:
+        if isinstance(item, dict) and isinstance(item.get("caption"), str):
+            item["caption"] = dedupe_leading_figure_number(item["caption"])
+
+    _fix(data)
+    charts = data.get("charts")
+    if isinstance(charts, list):
+        for chart in charts:
+            _fix(chart)
+    return data
+
+
 def validate_finish(task_type: str, payload: str, workdir, instruction: str = "") -> tuple[bool, str, str]:
     """finish 成果的结构检查（后端唯一的成果检查）；内容正确性由 AI 复核判断。"""
     try:
@@ -703,6 +721,8 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
     last_failure_key = ""
     same_run_python_turns = 0
     same_failure_turns = 0
+    code_repeat_warnings = 0
+    failure_repeat_warnings = 0
     run_python_failures = 0
     stalled_turns = 0
     turns_since_finish = 0
@@ -718,21 +738,31 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
     def _failure_digest() -> str:
         return "\n".join(f"- {item}" for item in failure_notes[-6:])
 
-    def _track_failure_observation(observation: str) -> None:
-        """同一失败观察连续出现（即使换了代码）同样说明卡死；成功路径不参与判定。"""
-        nonlocal last_failure_key, same_failure_turns
+    def _track_failure_observation(observation: str) -> str:
+        """同一失败观察连续出现（即使换了代码）时先提醒换做法，多次无变化才中止。"""
+        nonlocal last_failure_key, same_failure_turns, failure_repeat_warnings
         key = re.sub(r"\s+", " ", str(observation or "")).strip()
         if key and key == last_failure_key:
             same_failure_turns += 1
         else:
             last_failure_key = key
             same_failure_turns = 1
-        if same_failure_turns >= max(2, int(settings.REACT_STUCK_REPEAT_LIMIT)):
-            raise ReactRunError(
-                f"ReAct 连续 {same_failure_turns} 轮得到相同失败观察，模型可能陷入死循环"
-                f"（最后观察：{_react_preview(observation)}）",
-                failure_digest=_failure_digest(),
+            failure_repeat_warnings = 0
+        if same_failure_turns < max(2, int(settings.REACT_STUCK_REPEAT_LIMIT)):
+            return ""
+        same_failure_turns = 0
+        allowed = max(0, int(settings.REACT_STUCK_NUDGE_LIMIT))
+        if failure_repeat_warnings >= allowed:
+            _raise(
+                "ReAct 连续得到相同失败观察，模型可能陷入死循环"
+                f"（最后观察：{_react_preview(observation)}）"
             )
+        failure_repeat_warnings += 1
+        return (
+            "【系统提醒】你已经连续多次得到相同的失败结果。不要原样重试："
+            "先用一句话说明这次失败的原因，再换一种思路、换输入或缩小范围；"
+            "如果确认无法完成，请直接 finish 并说明具体原因。"
+        )
 
     def _raise(message: str) -> None:
         raise ReactRunError(message, failure_digest=_failure_digest())
@@ -859,12 +889,25 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             else:
                 last_run_python_input = normalized_input
                 same_run_python_turns = 1
+                code_repeat_warnings = 0
             if same_run_python_turns >= max(2, int(settings.REACT_STUCK_REPEAT_LIMIT)):
-                _raise(
-                    "ReAct 连续重复 run_python，模型可能陷入探索循环"
-                    f"（最后动作：run_python；代码摘要：{last_action_input}；"
-                    f"最后观察：{_react_preview(last_observation)}）"
+                allowed = max(0, int(settings.REACT_STUCK_NUDGE_LIMIT))
+                if code_repeat_warnings >= allowed:
+                    _raise(
+                        "ReAct 连续重复 run_python，模型可能陷入探索循环"
+                        f"（最后动作：run_python；代码摘要：{last_action_input}；"
+                        f"最后观察：{_react_preview(last_observation)}）"
+                    )
+                code_repeat_warnings += 1
+                same_run_python_turns = 0
+                warning = (
+                    "【系统提醒】你连续提交了完全相同的代码。不要原样重试："
+                    "先说明这段代码为什么没有解决问题，再换一种思路、换输入或缩小范围；"
+                    "如果确认无法完成，请直接 finish 并说明具体原因。"
                 )
+                messages.append({"role": "user", "content": f"【观察】{warning}"})
+                continue
+            failure_repeat = ""
             if workdir is None:
                 obs = "本任务没有代码执行环境，请直接 finish。"
                 run_python_failures = 0
@@ -882,7 +925,7 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
                     run_python_failures += 1
                     _remember_failure(
                         f"第{turn}轮 run_python 执行失败：{_react_preview(obs, 280)}")
-                    _track_failure_observation(obs)
+                    failure_repeat = _track_failure_observation(obs)
             turns_since_finish += 1
             stall = _stall_hint(turns_since_finish)
             urgency = _remaining_hint_for_turn()
@@ -894,8 +937,9 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
                     "请先阅读上面的错误信息、定位原因，再换一种思路或缩小范围重试；"
                     "不要重复相同代码，也不要靠扩大输出掩盖问题。"
                 )
-            if stall or urgency or failure_nudge:
-                obs = "\n".join(part for part in (obs, stall, failure_nudge, urgency) if part)
+            if stall or failure_repeat or urgency or failure_nudge:
+                obs = "\n".join(part for part in (
+                    obs, stall, failure_repeat, failure_nudge, urgency) if part)
             last_observation = obs
             last_note = (
                 f"最后动作：run_python；代码摘要：{last_action_input}；"
@@ -923,8 +967,10 @@ async def react_run(db: Session, cfg: ModelConfig, goal_prompt: str, workdir, ta
             logger.info("react finish rejected at turn %s: %s", turn, str(note)[:300])
             last_note = f"最后动作：finish；校验问题：{note}；成果摘要：{last_action_input}"
             _remember_failure(f"第{turn}轮 finish 被拒：{_react_preview(note, 300)}")
-            _track_failure_observation(f"成果未通过校验：{note}")
+            failure_repeat = _track_failure_observation(f"成果未通过校验：{note}")
             obs = f"成果未通过校验：{note}。请修正后重新 finish。"
+            if failure_repeat:
+                obs = f"{obs}\n{failure_repeat}"
             urgency = _remaining_hint_for_turn()
             if urgency:
                 obs = f"{obs}\n{urgency}"
@@ -1428,9 +1474,11 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
                 normalized = sanitize_table_json(normalized)
                 review_content = normalized
             else:
-                chart_data = json.loads(
-                    sandbox.output_path(directory, "out/chart_data.json").read_text(encoding="utf-8"))
+                chart_path = sandbox.output_path(directory, "out/chart_data.json")
+                chart_data = sanitize_chart_data(
+                    json.loads(chart_path.read_text(encoding="utf-8")))
                 normalized = json.dumps(chart_data, ensure_ascii=False)
+                chart_path.write_text(normalized, encoding="utf-8")
                 review_content = normalized
             result = await review_engine.review_generated_content(
                 db,
@@ -1456,7 +1504,8 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
         review_result = review_state.get("result") or {"status": "ok", "issues": []}
         review_content = review_state.get("content", payload)
         if task.task_type == "image":
-            chart_data = json.loads(sandbox.output_path(workdir, "out/chart_data.json").read_text(encoding="utf-8"))
+            chart_data = sanitize_chart_data(json.loads(
+                sandbox.output_path(workdir, "out/chart_data.json").read_text(encoding="utf-8")))
             verified_chart = sandbox.output_path(workdir, "out/verified_chart.png")
             await asyncio.to_thread(render_verified_chart, chart_data, task.instruction, verified_chart)
             image_path = f"{project.user_id}/{project_id}/images/task{task_id}_{uuid4().hex}.png"
