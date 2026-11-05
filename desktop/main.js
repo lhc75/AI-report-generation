@@ -4,7 +4,7 @@
  * Electron 主进程：启动内置 Python 后端（SQLite + 本地文件存储），
  * 后端同时托管前端页面，窗口直接加载本机 HTTP 地址。
  */
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, session, shell } = require('electron');
 const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -505,15 +505,26 @@ function createWindow() {
   return mainWindow;
 }
 
+async function clearCacheOnUpgrade() {
+  const marker = path.join(CONFIG_DIR, 'last-version.txt');
+  let previous = '';
+  try { previous = fs.readFileSync(marker, 'utf8').trim(); } catch (_) { /* 首次运行 */ }
+  if (previous === app.getVersion()) return;
+  // 端口固定为 18080，旧版本缓存会按同源继续返回旧页面；升级后清一次 HTTP 缓存。
+  try { await session.defaultSession.clearCache(); } catch (_) { /* 清缓存失败不阻断启动 */ }
+  try { fs.writeFileSync(marker, app.getVersion()); } catch (_) { /* ignore */ }
+}
+
 async function boot() {
   ensureDirs();
   const logFile = openBackendLog();
   try {
     const port = await pickBackendPort();
     await startBackend(port, logFile);
+    await clearCacheOnUpgrade();
     buildMenu();
     const win = createWindow();
-    await win.loadURL(`http://127.0.0.1:${port}/`);
+    await win.loadURL(`http://127.0.0.1:${port}/?v=${encodeURIComponent(app.getVersion())}`);
   } catch (error) {
     dialog.showErrorBox(`${APP_NAME} 启动失败`, error.message || String(error));
     app.quit();
@@ -547,7 +558,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0 && backendPort && !quitting) {
       const win = createWindow();
-      win.loadURL(`http://127.0.0.1:${backendPort}/`);
+      win.loadURL(`http://127.0.0.1:${backendPort}/?v=${encodeURIComponent(app.getVersion())}`);
     }
   });
 

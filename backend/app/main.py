@@ -118,13 +118,19 @@ def _mount_frontend() -> None:
     assets = root / "assets"
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
+    index_file = root / "index.html"
+    # 入口 HTML 必须每次回源：客户端升级后旧缓存会继续引用已删除的旧 chunk，
+    # 表现为“装了新版本但界面还是旧的”。
+    no_store = {"Cache-Control": "no-store, must-revalidate"}
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str):
         candidate = (root / full_path).resolve()
         if candidate.is_file() and candidate.is_relative_to(root):
+            if candidate == index_file:
+                return FileResponse(candidate, headers=no_store)
             return FileResponse(candidate)
-        return FileResponse(root / "index.html")
+        return FileResponse(index_file, headers=no_store)
 
 
 _mount_frontend()
