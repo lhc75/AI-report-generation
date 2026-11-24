@@ -140,7 +140,8 @@ def test_display_table_numbers_follow_actual_order(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "question.json").write_text(
-        json.dumps({"title": "表1 问卷内容概览", "columns": ["对象"], "rows": [["小学生"]]},
+        json.dumps({"title": "表1 问卷内容概览", "columns": ["对象"], "rows": [["小学生"]],
+                    "note": "本表见表1。"},
                    ensure_ascii=False),
         encoding="utf-8",
     )
@@ -157,6 +158,7 @@ def test_display_table_numbers_follow_actual_order(tmp_path):
     assert "构成见表1。" in front
     assert "表1　问卷构成" in front
     assert question["title"].startswith("表2 ")
+    assert question["note"] == "本表见表2。"
     assert body == "问卷索引见表2。"
 
 

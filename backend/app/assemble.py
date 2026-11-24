@@ -330,7 +330,8 @@ def _renumber_display_tables(workdir: Path, nodes: list[dict]) -> None:
             else:
                 title = f"表{own['new']}"
             table["title"] = title
-            for container in (table, payload):
+            containers = [payload] if table is payload else [table, payload]
+            for container in containers:
                 for key, value in list(container.items()):
                     if key in {"table", "title"} or value is table:
                         continue
