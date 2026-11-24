@@ -694,6 +694,21 @@ def _option_code_key_notes(header: list, body: list) -> list[str]:
     return []
 
 
+_META_CELL_RE = re.compile(
+    r"^(?:id|username|region|question\d+(?:_[A-Za-z0-9]+)?|q\d+(?:_[A-Za-z0-9]+)?)$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_question_code_row(row: list) -> bool:
+    """识别平台导出中位于表头下的题目编码映射行，不能把它计为提交记录。"""
+    cells = [str(value).strip() for value in row if str(value).strip()]
+    if len(cells) < 3:
+        return False
+    matches = sum(bool(_META_CELL_RE.fullmatch(value)) for value in cells)
+    return matches >= 3 and matches / len(cells) >= 0.6
+
+
 def summarize_data_structure(name: str, data: bytes) -> str:
     """数据文件的结构摘要：工作表、行数、列名与资料自带的编码对照（不含统计结果）。"""
     lines = [f"文件 {name}："]
@@ -701,13 +716,15 @@ def summarize_data_structure(name: str, data: bytes) -> str:
         if not rows:
             continue
         header, body = rows[0], rows[1:]
-        lines.append(f"工作表“{sheet}”：{len(body)}条提交记录；列：{'、'.join(header)}")
-        for _ci, (_name_ci, mapping) in _code_name_mappings(header, body).items():
+        record_start = 1 if body and _looks_like_question_code_row(body[0]) else 0
+        records = body[record_start:]
+        lines.append(f"工作表“{sheet}”：{len(records)}条提交记录；列：{'、'.join(header)}")
+        for _ci, (_name_ci, mapping) in _code_name_mappings(header, records).items():
             lines.append("编码对照（资料原有名称）：" + "；".join(f"{key}={value}" for key, value in mapping.items()))
-        lines.extend(_option_code_key_notes(header, body))
-        if body:
+        lines.extend(_option_code_key_notes(header, records))
+        if records:
             sample = "；".join(f"{header[ci]}={str(value)[:60]}"
-                              for ci, value in enumerate(body[0][:len(header)]))
+                              for ci, value in enumerate(records[0][:len(header)]))
             lines.append(f"原始样例（非统计结果）：{sample[:400]}")
     lines.append("全部统计数字必须用 run_python 从数据文件计算；提交记录不自动等于独立有效人数。")
     return "\n".join(lines)

@@ -848,6 +848,17 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
 
     只有 AI 明确判定的 error 拦截导出；复核未完成（模型或协议问题）记提示放行。
     """
+    if settings.SKIP_EXPORT_REVIEW:
+        tasks = db.scalars(
+            select(ChapterTask)
+            .where(ChapterTask.project_id == project.id, ChapterTask.task_type != "heading")
+            .order_by(ChapterTask.sort)
+        ).all()
+        _normalize_chart_captions(db, project, tasks, run_token)
+        logger.warning("项目 %s 已按 SKIP_EXPORT_REVIEW 跳过导出前 AI 审核", project.id)
+        return {"ok": True, "issues": [], "warnings": [{
+            "severity": "warning", "title": "导出前审核",
+            "message": "已按 SKIP_EXPORT_REVIEW 跳过 AI 内容审核；装配、结构和渲染校验仍会执行。"}]}
     cfg = generate.pick_model(db, project.user_id, "review")
     if cfg is None:
         return {"ok": False, "issues": [

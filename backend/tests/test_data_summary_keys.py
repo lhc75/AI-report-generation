@@ -1,4 +1,8 @@
 """数据摘要中的选项编码键位规律说明（键号与题号偏移）。"""
+import io
+
+from openpyxl import Workbook
+
 from app import template_parse
 
 
@@ -35,3 +39,39 @@ def test_plain_csv_without_packed_codes_has_no_key_note():
     )
     summary = _summary(csv_text)
     assert "键：选项" not in summary
+
+
+def _xlsx_bytes(rows: list[list[str]]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "问卷"
+    for row in rows:
+        sheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def test_data_summary_excludes_question_code_mapping_row_from_submission_count():
+    raw = _xlsx_bytes([
+        ["姓别", "年级", "地区", "话题_了解法律"],
+        ["id", "username", "region", "question13_A"],
+        ["男", "五年级", "贵阳", "A"],
+        ["女", "六年级", "遵义", "B"],
+        ["男", "五年级", "铜仁", "C"],
+    ])
+    summary = template_parse.summarize_data_structure("问卷.xlsx", raw)
+    assert "3条提交记录" in summary
+    assert "4条提交记录" not in summary
+    assert "原始样例（非统计结果）：姓别=男；年级=五年级；地区=贵阳" in summary
+
+
+def test_data_summary_keeps_first_actual_row_when_it_is_not_a_code_mapping():
+    raw = _xlsx_bytes([
+        ["姓名", "成绩", "备注"],
+        ["甲", "90", "正常"],
+        ["乙", "80", "正常"],
+    ])
+    summary = template_parse.summarize_data_structure("成绩.xlsx", raw)
+    assert "2条提交记录" in summary
+    assert "原始样例（非统计结果）：姓名=甲；成绩=90" in summary

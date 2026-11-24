@@ -510,6 +510,21 @@ def test_warning_only_passes_with_warnings(project, db, monkeypatch):
     assert result["warnings"][0]["message"] == "建议精简表述"
 
 
+
+def test_skip_export_review_is_explicit_and_still_normalizes(project, db, monkeypatch):
+    item, task, user = project
+    _seed_content(db, item, task, "正文" * 60)
+    monkeypatch.setattr(review.settings, "SKIP_EXPORT_REVIEW", True)
+
+    async def must_not_review(*_args, **_kwargs):
+        raise AssertionError("review model must not run when export review is skipped")
+
+    monkeypatch.setattr(review, "_module_review", must_not_review)
+    result = asyncio.run(review.review_and_repair(db, item))
+    assert result["ok"]
+    assert result["warnings"][0]["title"] == "导出前审核"
+    assert "装配、结构和渲染校验仍会执行" in result["warnings"][0]["message"]
+
 def test_missing_content_blocks_export(project, db, monkeypatch):
     item, task, user = project
     _review_config(db, user)
