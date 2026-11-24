@@ -44,6 +44,9 @@ _SIGNOFF_AUTHOR_RE = re.compile(
     r"(?:研究院|研究所|大学|学院|学校|教育局|教育厅|委员会|人民政府|办公室|"
     r"课题组|项目组|调查组|编写组|工作组|研究团队|公司|协会|学会)$"
 )
+_MARKDOWN_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_TABLE_CAPTION_RE = re.compile(r"^\s*表\s*(\d+)(?=\s|　|$)")
+_TABLE_REFERENCE_RE = re.compile(r"表\s*(\d+)")
 
 
 class TemplateAssemblyError(ValueError):
@@ -168,6 +171,172 @@ def _node_content_file(workdir: Path, task: ChapterTask, content: ModuleContent 
         (workdir / rel).write_bytes(storage.download_bytes(content.image_path))
         return rel
     return None
+
+
+def _table_occurrences(workdir: Path, nodes: list[dict]) -> list[dict[str, Any]]:
+    """按最终正文顺序记录全部表格（含正文中的 Markdown 表格）。"""
+    occurrences: list[dict[str, Any]] = []
+    for node_index, node in enumerate(nodes):
+        relative = node.get("file")
+        if not relative:
+            continue
+        path = Path(workdir) / relative
+        if node["type"] == "text":
+            text = path.read_text(encoding="utf-8")
+            lines = text.splitlines()
+            for table in _markdown_tables(text):
+                old_number = None
+                for cursor in range(table["start"] - 1, max(-1, table["start"] - 5), -1):
+                    if not lines[cursor].strip():
+                        continue
+                    match = _TABLE_CAPTION_RE.match(lines[cursor].strip())
+                    if match:
+                        old_number = int(match.group(1))
+                    break
+                occurrences.append({
+                    "node_index": node_index, "node": node,
+                    "kind": "embedded", "line": table["start"],
+                    "old": old_number,
+                })
+        elif node["type"] == "table":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            table = payload.get("table", payload)
+            title = str(table.get("title", "") or "").strip()
+            match = _TABLE_CAPTION_RE.match(title)
+            occurrences.append({
+                "node_index": node_index, "node": node, "kind": "task",
+                "line": None, "old": int(match.group(1)) if match else None,
+            })
+    for number, occurrence in enumerate(occurrences, start=1):
+        occurrence["new"] = number
+    return occurrences
+
+
+def _nearest_table_number(number: int, node_index: int,
+                          occurrences: list[dict[str, Any]]) -> str | None:
+    candidates = [item for item in occurrences if item.get("old") == number]
+    if not candidates:
+        return None
+    nearest = min(candidates, key=lambda item: (abs(item["node_index"] - node_index),
+                                                item["node_index"] > node_index))
+    return f"表{nearest['new']}"
+
+
+def _remap_table_references(value: str, node_index: int,
+                            occurrences: list[dict[str, Any]]) -> str:
+    def replace(match: re.Match) -> str:
+        mapped = _nearest_table_number(int(match.group(1)), node_index, occurrences)
+        return mapped or match.group(0)
+
+    return _TABLE_REFERENCE_RE.sub(replace, value)
+
+
+def _walk_strings(value: Any, transform) -> Any:
+    if isinstance(value, str):
+        return transform(value)
+    if isinstance(value, list):
+        return [_walk_strings(item, transform) for item in value]
+    if isinstance(value, dict):
+        return {key: _walk_strings(item, transform) for key, item in value.items()}
+    return value
+
+
+def _table_semantic_signature(table: dict) -> str:
+    """表格语义指纹：忽略行列顺序，用于识别正文与独立表格任务中的重复数据。"""
+    columns = [str(value).strip() for value in table.get("columns", [])]
+    rows = table.get("rows", [])
+    normalized_rows = []
+    for row in rows:
+        cells = [str(value).strip().replace(",", "") for value in row]
+        normalized_rows.append(sorted(cells))
+    return json.dumps({
+        "column_count": len(columns),
+        "rows": sorted(normalized_rows),
+    }, ensure_ascii=False)
+
+
+def _dedupe_embedded_tables(workdir: Path, nodes: list[dict]) -> None:
+    """正文误生成的 Markdown 表若与独立表格任务内容相同，只保留独立表格。"""
+    task_signatures = set()
+    for node in nodes:
+        if node["type"] != "table" or not node.get("file"):
+            continue
+        payload = json.loads((Path(workdir) / node["file"]).read_text(encoding="utf-8"))
+        table = payload.get("table", payload)
+        if isinstance(table, dict):
+            task_signatures.add(_table_semantic_signature(table))
+    if not task_signatures:
+        return
+    for node in nodes:
+        if node["type"] != "text" or not node.get("file"):
+            continue
+        path = Path(workdir) / node["file"]
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        remove: set[int] = set()
+        for table in _markdown_tables(text):
+            if _table_semantic_signature(table) not in task_signatures:
+                continue
+            remove.update(range(table["start"], table["end"]))
+            for cursor in range(table["start"] - 1, max(-1, table["start"] - 5), -1):
+                if not lines[cursor].strip():
+                    continue
+                if _TABLE_CAPTION_RE.match(lines[cursor].strip()):
+                    remove.add(cursor)
+                break
+        if remove:
+            path.write_text(
+                "\n".join(line for index, line in enumerate(lines) if index not in remove),
+                encoding="utf-8",
+            )
+
+
+def _renumber_display_tables(workdir: Path, nodes: list[dict]) -> None:
+    """按实际出现顺序重排表号，并同步正文引用，避免前置表格造成编号倒置。"""
+    occurrences = _table_occurrences(workdir, nodes)
+    if not occurrences:
+        return
+    for node_index, node in enumerate(nodes):
+        relative = node.get("file")
+        if not relative:
+            continue
+        path = Path(workdir) / relative
+        if node["type"] == "text":
+            lines = path.read_text(encoding="utf-8").splitlines()
+            exact_lines = {
+                item["line"]: item["new"] for item in occurrences
+                if item["kind"] == "embedded" and item["node_index"] == node_index
+            }
+            rewritten = []
+            for index, line in enumerate(lines):
+                if index in exact_lines:
+                    line = _TABLE_REFERENCE_RE.sub(f"表{exact_lines[index]}", line, count=1)
+                else:
+                    line = _remap_table_references(line, node_index, occurrences)
+                rewritten.append(line)
+            path.write_text("\n".join(rewritten), encoding="utf-8")
+        elif node["type"] == "table":
+            own = next((item for item in occurrences
+                        if item["kind"] == "task" and item["node_index"] == node_index), None)
+            if own is None:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            table = payload.get("table", payload)
+            title = str(table.get("title", "") or "").strip()
+            if _TABLE_CAPTION_RE.match(title):
+                title = _TABLE_REFERENCE_RE.sub(f"表{own['new']}", title, count=1)
+            elif title:
+                title = f"表{own['new']} {title}"
+            else:
+                title = f"表{own['new']}"
+            table["title"] = title
+            for container in (table, payload):
+                for key, value in list(container.items()):
+                    if key in {"table", "title"} or value is table:
+                        continue
+                    container[key] = _walk_strings(
+                        value, lambda text: _remap_table_references(text, node_index, occurrences))
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 def _validated_chart_metadata(task: ChapterTask, content: ModuleContent) -> dict:
@@ -333,6 +502,14 @@ def prepare_manifest(db: Session, project: Project, workdir: Path, *,
         node for node in nodes
         if node["type"] != "heading" and not node.get("anchor_task_id")
     ]
+    _dedupe_embedded_tables(workdir, nodes)
+    _renumber_display_tables(workdir, nodes)
+    node_by_id = {node["id"]: node for node in nodes}
+    for change in editorial_changes:
+        node = node_by_id.get(change["task_id"])
+        if node and node.get("file"):
+            change["display_content_sha256"] = hashlib.sha256(
+                (workdir / node["file"]).read_bytes()).hexdigest()
     blank_slots = [node["id"] for node in template_nodes if not node.get("slot_key")]
     if blank_slots:
         raise TemplateAssemblyError(
@@ -681,6 +858,113 @@ def _insert_paragraph_after(element, text: str, ppr=None, parent=None) -> Any:
     paragraph = Paragraph(new_p, parent)
     paragraph.add_run(text)
     return new_p
+
+
+def _markdown_table_cells(line: str) -> list[str] | None:
+    """解析单个管道表格行；只接受带首尾竖线的标准 Markdown 行。"""
+    stripped = str(line or "").strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return None
+    return [cell.strip() for cell in stripped[1:-1].split("|")]
+
+
+def _markdown_table_at(lines: list[str], index: int) -> tuple[dict, int] | None:
+    """从 index 起识别 Markdown 表格，返回无标题表格数据及结束行号。"""
+    if index + 1 >= len(lines):
+        return None
+    columns = _markdown_table_cells(lines[index])
+    separators = _markdown_table_cells(lines[index + 1])
+    if (not columns or not separators or len(columns) != len(separators)
+            or any(not _MARKDOWN_SEPARATOR_CELL_RE.fullmatch(cell) for cell in separators)):
+        return None
+    rows: list[list[str]] = []
+    cursor = index + 2
+    while cursor < len(lines):
+        cells = _markdown_table_cells(lines[cursor])
+        if cells is None or len(cells) != len(columns):
+            break
+        rows.append(cells)
+        cursor += 1
+    if not rows:
+        return None
+    return {"columns": columns, "rows": rows}, cursor
+
+
+def _markdown_tables(text: str) -> list[dict[str, Any]]:
+    """列出正文中的 Markdown 表格及其行范围。"""
+    lines = str(text or "").splitlines()
+    tables = []
+    index = 0
+    while index < len(lines):
+        parsed = _markdown_table_at(lines, index)
+        if parsed is None:
+            index += 1
+            continue
+        payload, end = parsed
+        tables.append({"start": index, "end": end, **payload})
+        index = end
+    return tables
+
+
+def _text_blocks(text: str) -> list[tuple[str, Any]]:
+    """把模块正文拆成自然段与原生表格块，避免导出管道字符。"""
+    lines = str(text or "").splitlines()
+    tables = {table["start"]: table for table in _markdown_tables(text)}
+    blocks: list[tuple[str, Any]] = []
+    index = 0
+    while index < len(lines):
+        table = tables.get(index)
+        if table is not None:
+            blocks.append(("table", {"columns": table["columns"], "rows": table["rows"]}))
+            index = table["end"]
+            continue
+        line = lines[index].strip()
+        if line:
+            blocks.append(("paragraph", line))
+        index += 1
+    return blocks
+
+
+def _relocate_section_properties(elements: list[Any], tail) -> None:
+    """混合正文与表格重排后，把分节属性唯一地放到末尾段落。"""
+    section_properties = None
+    for element in elements:
+        properties = getattr(element, "pPr", None)
+        if properties is None:
+            continue
+        found = properties.find(qn("w:sectPr"))
+        if found is not None:
+            properties.remove(found)
+            section_properties = found
+    if section_properties is not None:
+        tail.get_or_add_pPr().append(section_properties)
+
+
+def _replace_text_blocks_after(doc: Document, anchor_p, text: str) -> Any:
+    """用自然段和原生 Word 表格替换文字 slot，兼容模型误输出的管道表格。"""
+    blocks = _text_blocks(text)
+    if not blocks:
+        return _replace_with_text(anchor_p, text)
+    parent = anchor_p.getparent()
+    original_ppr = anchor_p.pPr
+    current = anchor_p
+    previous_kind = ""
+    touched = []
+    for block_index, (kind, value) in enumerate(blocks):
+        if block_index and previous_kind != "table":
+            current = _insert_paragraph_after(current, "", original_ppr, parent)
+        touched.append(current)
+        if kind == "paragraph":
+            paragraph = Paragraph(current, parent)
+            _remove_runs(paragraph)
+            paragraph.add_run(value)
+        else:
+            current = _insert_table_after(
+                doc, current, json.dumps({"table": value}, ensure_ascii=False))
+            touched.append(current)
+        previous_kind = kind
+    _relocate_section_properties(touched, current)
+    return current
 
 
 def _replace_with_text(anchor_p, text: str) -> Any:
@@ -1037,8 +1321,15 @@ def _validate_body_contents(doc: Document, manifest: dict, workdir: Path) -> Non
             continue
         path = Path(workdir) / node["file"]
         if node["type"] == "text":
-            lines = [line.strip() for line in re.split(r"\n+", path.read_text(encoding="utf-8")) if line.strip()]
-            expected_paragraphs.update(lines or ["（本模块内容待补充）"])
+            blocks = _text_blocks(path.read_text(encoding="utf-8"))
+            if not blocks:
+                expected_paragraphs["（本模块内容待补充）"] += 1
+            for kind, value in blocks:
+                if kind == "paragraph":
+                    expected_paragraphs[value] += 1
+                else:
+                    expected = [value["columns"], *value["rows"]]
+                    expected_tables[json.dumps(expected, ensure_ascii=False)] += 1
         elif node["type"] == "table":
             payload = json.loads(path.read_text(encoding="utf-8"))
             table = payload.get("table", payload)
@@ -1621,7 +1912,8 @@ def assemble_template_docx(template_path: Path, manifest: dict, output_path: Pat
             return _replace_with_text(anchor, "（本模块内容待补充）")
         path = template_path.parent / node["file"]
         if node["type"] == "text":
-            tail = _replace_with_text(
+            tail = _replace_text_blocks_after(
+                doc,
                 anchor, path.read_text(encoding="utf-8")
             )
             text_spans[node["id"]] = (anchor, tail)

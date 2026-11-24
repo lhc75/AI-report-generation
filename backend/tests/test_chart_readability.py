@@ -54,6 +54,13 @@ def test_wrap_label_prefers_parenthesis_break():
         "课堂更生动有趣\n（小学生·第十二题）"
 
 
+def test_chart_percent_labels_are_limited_to_one_decimal():
+    assert generate._chart_percent_label(44.38) == "44.4%"
+    assert generate._chart_percent_label(44.04) == "44%"
+    assert generate._chart_percent_label(100) == "100%"
+    assert generate._chart_percent_label("6.25") == "6.3%"
+
+
 def test_dense_chart_renders_horizontal(monkeypatch, tmp_path):
     calls = _record_bar_calls(monkeypatch)
     chart = {"title": "分布", "labels": [f"类别{i}" for i in range(12)],

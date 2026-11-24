@@ -102,3 +102,86 @@ def test_table_uses_anchor_geometry_content_widths_and_safe_row_pagination(tmp_p
     assert title.paragraph_format.keep_with_next
     assert result["before"]["geometry"] == result["after"]["geometry"]
     assert assemble.make_report_validator(manifest)("ok", tmp_path)[0]
+
+
+def test_markdown_table_in_text_is_rendered_as_native_word_table(tmp_path):
+    doc = Document()
+    slot = doc.add_paragraph("【填写：说明报告范围】")
+    doc.add_paragraph("后续正文")
+    template = tmp_path / "template.docx"
+    doc.save(template)
+    text = (
+        "本报告说明调查范围，组成见表2。\n\n"
+        "表2　各类问卷提交记录构成（单位：条）\n\n"
+        "| 统计项目 | 小学生 | 中学生 |\n"
+        "|---|---:|---:|\n"
+        "| 提交记录数 | 3,646 | 5,435 |\n\n"
+        "注：提交记录不等同于独立受访人数。"
+    )
+    (tmp_path / "text.txt").write_text(text, encoding="utf-8")
+    manifest = {"nodes": [
+        {"id": 1, "type": "text", "title": "说明", "level": 1,
+         "instruction": slot.text, "slot_key": "legacy-slot", "file": "text.txt"},
+    ]}
+    output = tmp_path / "out/report.docx"
+    assemble.assemble_template_docx(template, manifest, output)
+    report = Document(output)
+    assert len(report.tables) == 1
+    assert [cell.text for cell in report.tables[0].rows[0].cells] == ["统计项目", "小学生", "中学生"]
+    assert [cell.text for cell in report.tables[0].rows[1].cells] == ["提交记录数", "3,646", "5,435"]
+    assert all("|" not in paragraph.text for paragraph in report.paragraphs)
+    assert assemble.make_report_validator(manifest)("ok", tmp_path)[0]
+
+
+def test_display_table_numbers_follow_actual_order(tmp_path):
+    (tmp_path / "front.txt").write_text(
+        "六类问卷构成见表2。\n\n表2　问卷构成\n\n"
+        "| 对象 | 记录数 |\n|---|---:|\n| 小学生 | 3646 |\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "question.json").write_text(
+        json.dumps({"title": "表1 问卷内容概览", "columns": ["对象"], "rows": [["小学生"]]},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (tmp_path / "body.txt").write_text("问卷索引见表1。", encoding="utf-8")
+    nodes = [
+        {"id": 1, "type": "text", "file": "front.txt"},
+        {"id": 2, "type": "table", "file": "question.json"},
+        {"id": 3, "type": "text", "file": "body.txt"},
+    ]
+    assemble._renumber_display_tables(tmp_path, nodes)
+    front = (tmp_path / "front.txt").read_text(encoding="utf-8")
+    body = (tmp_path / "body.txt").read_text(encoding="utf-8")
+    question = json.loads((tmp_path / "question.json").read_text(encoding="utf-8"))
+    assert "构成见表1。" in front
+    assert "表1　问卷构成" in front
+    assert question["title"].startswith("表2 ")
+    assert body == "问卷索引见表2。"
+
+
+def test_embedded_markdown_table_duplicate_is_removed_when_table_task_exists(tmp_path):
+    task_table = {
+        "title": "表2 地区分布",
+        "columns": ["地区", "大学生", "小学生", "合计"],
+        "rows": [["贵阳", "6770", "936", "7706"], ["安顺", "597", "818", "1415"]],
+    }
+    (tmp_path / "table.json").write_text(json.dumps(task_table, ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "text.txt").write_text(
+        "地区情况见表2。\n\n表2 地区分布\n\n"
+        "| 地区 | 小学生 | 大学生 | 合计 |\n|---|---:|---:|---:|\n"
+        "| 安顺 | 818 | 597 | 1415 |\n"
+        "| 贵阳 | 936 | 6770 | 7706 |\n\n"
+        "正文继续说明地区差异。",
+        encoding="utf-8",
+    )
+    nodes = [
+        {"id": 1, "type": "table", "file": "table.json"},
+        {"id": 2, "type": "text", "file": "text.txt"},
+    ]
+    assemble._dedupe_embedded_tables(tmp_path, nodes)
+    text = (tmp_path / "text.txt").read_text(encoding="utf-8")
+    assert "| 地区 |" not in text
+    assert "表2 地区分布" not in text
+    assert text.startswith("地区情况见表2。")
+    assert "正文继续说明地区差异。" in text

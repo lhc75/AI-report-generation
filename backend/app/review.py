@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 SEVERITIES = {"error", "warning"}
 
 # 审核协议版本：判定口径或输出规则变化时递增，旧版本缓存自动失效并重新复核。
-REVIEW_PROTOCOL_VERSION = 8
+REVIEW_PROTOCOL_VERSION = 9
 
 
 class ReviewError(Exception):
@@ -97,6 +97,10 @@ _REVIEW_COMMON_NOTES = (
     "逐条重复塞进标签、多群体混排未拆面板、数值标注明显会堆叠——属于需要返工的可读性问题，"
     "应作为 error 报出；修正要求必须直接可执行（拆为 charts 分面板、设 layout=\"horizontal\"、"
     "精简 labels、把群体与题号移到面板标题）。\n"
+    "9. 当参考资料未提供某题选项原文或编码表时，不能仅以“无法从材料确认代码含义”为由拦截一份"
+    "频次、分母和占比均已复算一致、且未把未证实对应关系写成确定事实的成果；此类情况按 warning"
+    "提示即可。只有成果确实把错误选项含义写入图例、结论依赖该错误对应关系，或数字本身无法复算时，"
+    "才按 error 拦截。不要要求用户或生成模型提供当前材料中不存在的证明。\n"
 )
 
 MODULE_REVIEW_GOAL = (
@@ -306,7 +310,8 @@ async def review_generated_content(
         "写作指令": _trim(instruction, 4000),
         "成果内容": _trim(content_text, 8000),
         "数据摘要": _trim(data_summary, 4000),
-        "参考资料摘要": _trim(references, 3000),
+        # 选项原文和编码顺序常位于参考资料较后位置；过短截断会让审核误判“材料未提供”。
+        "参考资料摘要": _trim(references, 12000),
     }
     system_prompt = "\n\n".join(
         part for part in (render_system_prompt(db, cfg), LIGHT_REVIEW_GOAL) if part

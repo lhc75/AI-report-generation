@@ -17,7 +17,7 @@ import html
 import inspect
 import threading
 from uuid import uuid4
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from unicodedata import east_asian_width
 
@@ -284,7 +284,13 @@ _WRITING_GUIDE = (
     "顺序表述”，不得写“沿用原问卷编号”；\n"
     "10. 不得写入资料完备性或对码过程的声明（如“未取得正式施测编码表”“据现有问卷结构"
     "对应”等）；题目与数据的对应按数据摘要的键位规律和问卷资料核对即可，成文只保留读者"
-    "理解所必需的一句口径。\n"
+    "理解所必需的一句口径；\n"
+    "11. 正文只输出自然段，不得使用 Markdown 标题、加粗、代码块或管道表格；"
+    "需要数据表时由独立的表格任务生成，正文只写必要结论；\n"
+    "12. 不要自行编造或固定填写表号、图号；系统按实际出现顺序统一编号。"
+    "需要指向紧随其后的材料时写“见下表/见下图”，确需引用时只使用任务指令明确给出的编号；\n"
+    "13. 父级标题的导语只交代本节范围和阅读路径，不得复述下一级标题的开头结论，"
+    "避免与首个子节正文出现两个意思相同的开头段。\n"
 )
 
 TEXT_GOAL = (
@@ -346,6 +352,8 @@ IMAGE_GOAL = (
     "不要逐条重复；类别较多（经验上超过 10 个）或名称较长时使用横向条形"
     "（layout=\"horizontal\"）；\n"
     "6.4 数值标签保持单行（如“206条 / 64.4%”），不要写多行堆叠或重复口径的文字；\n"
+    "6.5 频数标签使用整数；占比、构成比和多选勾选率标签最多保留 1 位小数，"
+    "不得显示 44.38% 这类多位小数（应显示为 44.4%）；\n"
     "7. finish 的 action_input 填一句图片说明；\n"
     + _WRITING_GUIDE +
     "【数据文件】./data/ 目录：{data_files}\n"
@@ -1437,6 +1445,14 @@ def _chart_number_label(value) -> str:
     return f"{number:.0f}" if number.is_integer() else format(Decimal(str(number)), "f")
 
 
+def _chart_percent_label(value) -> str:
+    """图表百分比统一最多保留一位小数，避免像素文字出现长小数。"""
+    number = _chart_value(value)
+    rounded = Decimal(str(number)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    text = format(rounded, "f").rstrip("0").rstrip(".")
+    return f"{text or '0'}%"
+
+
 def _fit_chart_annotations(fig, ax, annotations: list, horizontal: bool) -> None:
     """根据实际字形宽度预留注值空间，长频次/比例不会贴到边框。"""
     for _ in range(4):
@@ -1559,7 +1575,7 @@ def _draw_verified_chart(fig, ax, chart_data: dict, instruction: str, *, documen
         if counts:
             parts.append(f"{_chart_number_label(counts[i])}条")
         if percentages:
-            parts.append(f"{_chart_number_label(percentages[i])}%")
+            parts.append(_chart_percent_label(percentages[i]))
         annotations.append(" / ".join(parts) or _chart_number_label(value))
     title = str(chart_data.get("title", "") or "").strip() or "统计图"
     chart_hint = (instruction or "").lower()
@@ -1575,7 +1591,7 @@ def _draw_verified_chart(fig, ax, chart_data: dict, instruction: str, *, documen
             raise ValueError("饼图缺少完整类别与分母校验，请重新生成")
         percentages = iter(chart_data["pie_percentages"])
         ax.pie(chart_data["pie_counts"], labels=labels,
-               autopct=lambda _pct: f"{next(percentages):g}%", startangle=90)
+               autopct=lambda _pct: _chart_percent_label(next(percentages)), startangle=90)
     elif is_line:
         x_positions = list(range(len(labels)))
         ax.plot(x_positions, values, marker="o")
