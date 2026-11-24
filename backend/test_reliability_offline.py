@@ -341,7 +341,8 @@ def export_audit_test(db, user):
     finally:
         review._module_review, review._final_review = original_module, original_final
         generate.generate_task = original_generate_task
-    check(not final_blocked["ok"] and final_blocked["issues"][0]["message"] == "两处结论相互矛盾",
+    check(not final_blocked["ok"] and any(
+              item["message"] == "两处结论相互矛盾" for item in final_blocked["issues"]),
           "整稿复核 error 拦截导出")
 
     # 7b) 整稿复核 error 定位不到模块 → 只提示放行。

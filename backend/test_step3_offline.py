@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -399,7 +400,8 @@ def test_generate_all_concurrency(db, user):
     entry_statuses = {}
     orig_generate = generate.generate_task
 
-    async def fake_generate(task_db, task_project, task, user_prompt="", run_token=None):
+    async def fake_generate(task_db, task_project, task, user_prompt="", run_token=None,
+                            failure_summary=""):
         nonlocal running, max_running
         entry_statuses[task.id] = task.status
         task.status = "generating"
@@ -410,6 +412,7 @@ def test_generate_all_concurrency(db, user):
         running -= 1
         task.status = "done"
         task_db.commit()
+        return SimpleNamespace(status="ok", error_msg="")
 
     generate.generate_task = fake_generate
     try:

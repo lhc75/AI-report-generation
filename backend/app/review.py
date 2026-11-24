@@ -642,9 +642,12 @@ async def _review_modules_parallel(
 async def _regenerate_tasks_parallel(
         project_id: int, pending: list[ChapterTask], feedback: dict[int, str],
         results: dict[int, dict[str, Any]], run_token: str | None,
-        done: int, total: int) -> tuple[int, set[int]]:
-    """受限并行的模块重生成（复用 GENERATE_CONCURRENCY）；每完成一项即刷新进度。"""
+        done: int, total: int, *, attempts: dict[int, int] | None = None,
+        retry_limit: int | None = None) -> tuple[int, set[int]]:
+    """受限并行的模块诊断与重生成（复用 GENERATE_CONCURRENCY）。"""
     semaphore = asyncio.Semaphore(max(1, int(getattr(settings, "GENERATE_CONCURRENCY", 8))))
+    retry_limit = max(1, int(retry_limit or settings.FAILURE_RETRY_LIMIT or 5))
+    attempts = attempts or {}
 
     async def worker(task: ChapterTask) -> tuple[int, str]:
         async with semaphore:
@@ -654,9 +657,27 @@ async def _regenerate_tasks_parallel(
                     wtask = wdb.get(ChapterTask, task.id)
                     if wproject is None or wtask is None:
                         return task.id, "任务已失效"
+                    review_feedback = str(feedback.get(task.id, "") or "")
+                    previous = generate.previous_failure_summary(wdb, wtask)
+                    summary = await generate.diagnose_failure(
+                        wdb, wproject, wtask,
+                        current_error=review_feedback or "导出前内容审核未通过",
+                        review_context=review_feedback,
+                        previous_summary=previous,
+                        attempt=max(1, int(attempts.get(task.id, 1))),
+                        retry_limit=retry_limit)
+                    current = wdb.scalars(
+                        select(ModuleContent)
+                        .where(ModuleContent.chapter_task_id == task.id,
+                               ModuleContent.is_current == True)  # noqa: E712
+                        .order_by(ModuleContent.version.desc())
+                    ).first()
+                    if current is not None:
+                        current.failure_summary = summary[:12000]
+                        wdb.commit()
                     row = await generate.generate_task(
-                        wdb, wproject, wtask, user_prompt=feedback.get(task.id, ""),
-                        run_token=run_token)
+                        wdb, wproject, wtask, user_prompt=review_feedback,
+                        run_token=run_token, failure_summary=summary)
                     if row is not None and row.status == "ok":
                         return task.id, ""
                     return task.id, getattr(row, "error_msg", "") or "未知错误"
@@ -670,12 +691,14 @@ async def _regenerate_tasks_parallel(
         task_id, note = await future
         done += 1
         if note:
-            results[task_id] = {"status": "issues", "repairs": [], "issues": [
-                {"severity": "error", "message": f"重新生成未完成：{note}"}]}
+            results[task_id] = {
+                "status": "issues", "repairs": [], "non_retryable": not generate.is_retryable_failure(note),
+                "issues": [{"severity": "error", "message": f"重新生成未完成：{note}"}],
+            }
         else:
             succeeded.add(task_id)
         operations.report_progress(project_id, run_token, phase="repair",
-                                   label="定向修正/重新生成", done=done, total=total)
+                                   label="失败诊断/自动重试", done=done, total=total)
     return done, succeeded
 
 
@@ -847,7 +870,7 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
     deadline = time.monotonic() + budget if budget > 0 else None
     history: dict[int, list[str]] = {}
     task_regen_counts: dict[int, int] = {}
-    regen_cap = max(1, int(settings.REVIEW_MAX_TASK_REGENS or 4))
+    regen_cap = max(1, int(settings.FAILURE_RETRY_LIMIT or 5))
     last_signature = ""
     stalled_rounds = 0
     round_no = 0
@@ -903,14 +926,11 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
             stalled_rounds += 1
         else:
             last_signature, stalled_rounds = signature, 0
-        if stalled_rounds >= max(1, int(settings.REVIEW_NO_PROGRESS_LIMIT)):
-            db.commit()
-            return {"ok": False, "issues": errors + [
-                _review_stop_issue("无进展", f"连续 {stalled_rounds + 1} 轮问题没有变化")]}
+        # 同一审核问题也要完成 5 次诊断重试；达到模块上限后再停止。
         target_ids = {item["task_id"] for item in errors}
         fix_total = max(1, len(target_ids))
         operations.report_progress(project.id, run_token, phase="repair",
-                                   label="定向修正/重新生成", done=0, total=fix_total)
+                                   label="失败诊断/自动重试", done=0, total=fix_total)
         repairs = [
             repair for task in tasks
             for repair in results.get(task.id, {}).get("repairs", [])
@@ -919,11 +939,15 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
         fix_done = len(applied)
         if fix_done:
             operations.report_progress(project.id, run_token, phase="repair",
-                                       label="定向修正/重新生成",
+                                       label="失败诊断/自动重试",
                                        done=fix_done, total=fix_total)
         # 无可用定向修正的模块：带着审核意见自动重新生成（等价于人工点“重写”）。
         regenerated: set[int] = set()
-        unresolved_tasks = [task for task in tasks if task.id in target_ids - applied]
+        unresolved_tasks = [
+            task for task in tasks
+            if task.id in target_ids - applied
+            and not results.get(task.id, {}).get("non_retryable")
+        ]
         capped_tasks = [task for task in unresolved_tasks
                         if task_regen_counts.get(task.id, 0) >= regen_cap]
         unresolved_tasks = [task for task in unresolved_tasks
@@ -960,7 +984,7 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
                 task_regen_counts[task.id] = task_regen_counts.get(task.id, 0) + 1
             fix_done, regenerated = await _regenerate_tasks_parallel(
                 project.id, unresolved_tasks, feedback_map, results, run_token,
-                fix_done, fix_total)
+                fix_done, fix_total, attempts=task_regen_counts, retry_limit=regen_cap)
         if not applied and not regenerated:
             db.commit()
             return {"ok": False, "issues": errors + [
@@ -1034,22 +1058,24 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
             final_stalled += 1
         else:
             last_final_signature, final_stalled = signature, 0
-        if final_stalled >= max(1, int(settings.REVIEW_NO_PROGRESS_LIMIT)):
-            final_stop = _review_stop_issue("无进展", f"连续 {final_stalled + 1} 轮问题没有变化")
-            break
+        # 整稿冲突同样保留到单个模块的 5 次诊断重试额度用完。
         repair_ids = {item["task_id"] for item in final_repairs}
         fix_total = max(1, len(target_ids | repair_ids))
         operations.report_progress(project.id, run_token, phase="repair",
-                                   label="定向修正/重新生成", done=0, total=fix_total)
+                                   label="失败诊断/自动重试", done=0, total=fix_total)
         # 先落盘 AI 给出的单点勘误（唯一匹配才生效），再对无法直接修复的模块重生成。
         applied_final = (_apply_repairs(db, project, final_repairs, cfg.model, run_token)
                          if final_repairs else set())
         fix_done = len(applied_final)
         if fix_done:
             operations.report_progress(project.id, run_token, phase="repair",
-                                       label="定向修正/重新生成",
+                                       label="失败诊断/自动重试",
                                        done=fix_done, total=fix_total)
-        regen_tasks = [task for task in tasks if task.id in target_ids - applied_final]
+        regen_tasks = [
+            task for task in tasks
+            if task.id in target_ids - applied_final
+            and not results.get(task.id, {}).get("non_retryable")
+        ]
         capped_final = [task for task in regen_tasks
                         if task_regen_counts.get(task.id, 0) >= regen_cap]
         regen_tasks = [task for task in regen_tasks
@@ -1087,7 +1113,7 @@ async def review_and_repair(db: Session, project: Project, max_rounds: int | Non
                 task_regen_counts[task.id] = task_regen_counts.get(task.id, 0) + 1
             fix_done, regenerated_final = await _regenerate_tasks_parallel(
                 project.id, regen_tasks, feedback_map, results, run_token,
-                fix_done, fix_total)
+                fix_done, fix_total, attempts=task_regen_counts, retry_limit=regen_cap)
         if not applied_final and not regenerated_final:
             final_stop = _review_stop_issue("无进展", "本轮没有可执行的修复或重生成")
             break

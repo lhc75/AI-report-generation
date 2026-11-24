@@ -75,6 +75,7 @@ def finish_run(project_id: int, token: str, status: str, result: dict) -> None:
 
 # 阶段权重：导出总进度中各阶段占用的百分比区间（仅用于进度条展示）。
 _PROGRESS_PHASES = {
+    "generate": (0, 90),
     "review": (0, 60),
     "repair": (60, 75),
     "final": (75, 80),

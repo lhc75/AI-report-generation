@@ -49,7 +49,7 @@
       </div>
     </div>
 
-    <div v-if="project?.status === 'assembling' && project?.progress?.label" class="progress-row">
+    <div v-if="['generating', 'assembling'].includes(project?.status) && project?.progress?.label" class="progress-row">
       <el-progress
         :percentage="project.progress.percent || 0"
         :stroke-width="12"
@@ -250,6 +250,10 @@
         v-if="contentDetail?.status === 'failed'"
         type="error" :title="contentDetail.error_msg" show-icon style="margin-bottom: 12px"
       />
+      <div v-if="contentDetail?.failure_summary" class="failure-summary">
+        <div class="failure-summary-title">失败诊断（系统总结）</div>
+        <pre>{{ contentDetail.failure_summary }}</pre>
+      </div>
       <div v-if="contentDetail?.prompt" class="content-prompt">重写要求：{{ contentDetail.prompt }}</div>
       <div v-loading="contentLoading" class="content-body">
         <template v-if="contentDetail?.status === 'ok'">
@@ -857,6 +861,9 @@ onBeforeUnmount(() => {
 .page-title { margin: 0; font-size: 17px; }
 .progress-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .progress-label { color: #606266; font-size: 13px; white-space: nowrap; }
+.failure-summary { margin-bottom: 12px; padding: 12px 14px; border: 1px solid #f3d19e; border-radius: 6px; background: #fdf6ec; color: #7a4f01; }
+.failure-summary-title { margin-bottom: 8px; font-weight: 600; }
+.failure-summary pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.6; }
 .upload-row { margin-bottom: 20px; }
 .upload-card {
   background: #fff; border: 1px solid #e4e7ed; border-radius: 8px; padding: 14px 16px;

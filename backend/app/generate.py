@@ -1011,6 +1011,210 @@ def _previous_failure_memory(db: Session, task: ChapterTask) -> str:
     return "\n".join(lines)
 
 
+FAILURE_DIAGNOSIS_GOAL = (
+    "【任务】你是报告模块失败诊断员。只根据用户提供的任务指令、真实错误、失败摘要和审核意见，"
+    "总结可复现的失败根因，并给出下一次生成必须执行的具体修正策略。\n"
+    "不要编造数据、数字、题号或文件内容；不要把推测写成事实。\n"
+    "请合并已有累计诊断，保留仍未解决的旧问题，去除重复项，并记录已经尝试但失败的做法。\n"
+    "只输出一个 JSON 对象，字段必须为：\n"
+    '{"root_causes":["根因"],"fix_strategies":["下一轮怎么做"],'
+    '"failed_approaches":["已尝试且无效的做法"],"must_verify":["重试前必须核验的事项"]}\n'
+    "每个数组最多 6 项，每项不超过 240 字；没有内容时输出空数组。"
+)
+
+_NON_RETRYABLE_FAILURE_MARKERS = (
+    "未找到模型配置",
+    "未配置审核模型",
+    "未配置最终 AI 审核模型",
+    "模型未配置服务地址",
+    "模型未配置模型名称",
+    "模型配置可能不兼容当前协议",
+    "没有数据文件",
+    "请先上传 DOCX 模板",
+    "请先完成模版分析",
+    "任务已失效",
+    "操作已失效",
+    "401 unauthorized",
+    "403 forbidden",
+)
+
+
+def is_retryable_failure(message: str) -> bool:
+    """配置、鉴权或项目前置条件错误重试无意义，直接交回用户处理。"""
+    lowered = str(message or "").lower()
+    if re.search(r"(?<!\d)(401|403)(?!\d)", lowered):
+        return False
+    return not any(marker.lower() in lowered for marker in _NON_RETRYABLE_FAILURE_MARKERS)
+
+
+def _failure_summary_obj(value: str) -> dict:
+    try:
+        obj = json.loads(value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        obj = {}
+    if not isinstance(obj, dict):
+        return {}
+
+    def items(key: str) -> list[str]:
+        raw = obj.get(key, [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()][:6]
+
+    try:
+        attempt = max(0, int(obj.get("attempt") or 0))
+    except (TypeError, ValueError):
+        attempt = 0
+    return {
+        "attempt": attempt,
+        "root_causes": items("root_causes"),
+        "fix_strategies": items("fix_strategies"),
+        "failed_approaches": items("failed_approaches"),
+        "must_verify": items("must_verify"),
+    }
+
+
+def _merge_failure_items(*groups: list[str]) -> list[str]:
+    merged = []
+    for item in (value.strip() for group in groups for value in group):
+        item = re.sub(r"\s+", " ", item)[:240]
+        if item and item not in merged:
+            merged.append(item)
+    return merged[-6:]
+
+
+def failure_summary_text(value: str) -> str:
+    """把内部诊断 JSON 转成界面可读文本；兼容历史空值。"""
+    obj = _failure_summary_obj(value)
+    if not obj:
+        return str(value or "").strip()
+    sections = []
+    labels = (
+        ("root_causes", "根因"),
+        ("fix_strategies", "修正策略"),
+        ("failed_approaches", "已失败做法"),
+        ("must_verify", "重试前必须核验"),
+    )
+    for key, label in labels:
+        items = obj.get(key) or []
+        if items:
+            sections.append(f"【{label}】\n" + "\n".join(f"- {item}" for item in items))
+    return "\n".join(sections) or (f"已完成 {obj['attempt']} 次失败诊断" if obj.get("attempt") else "")
+
+
+def _fallback_failure_diagnosis(current_error: str, failure_digest: str,
+                                previous: dict, attempt: int) -> dict:
+    digest_lines = [
+        re.sub(r"^\s*-\s*", "", line).strip()
+        for line in str(failure_digest or "").splitlines()
+        if line.strip()
+    ][-6:]
+    root = re.sub(r"\s+", " ", str(current_error or "生成任务最终失败")).strip()[:240]
+    return {
+        "attempt": attempt,
+        "root_causes": _merge_failure_items(previous.get("root_causes", []), [root]),
+        "fix_strategies": _merge_failure_items(
+            previous.get("fix_strategies", []),
+            ["先核对失败事实和数据/题号映射，再采用与已失败做法不同的实现路径完成成果。"],
+        ),
+        "failed_approaches": _merge_failure_items(
+            previous.get("failed_approaches", []), digest_lines or [root]),
+        "must_verify": _merge_failure_items(
+            previous.get("must_verify", []),
+            ["重新提交前确认成果文件、结构、数字口径和审核意见均已逐项处理。"],
+        ),
+    }
+
+
+async def diagnose_failure(db: Session, project: Project, task: ChapterTask, *,
+                           current_error: str, failure_digest: str = "",
+                           review_context: str = "", previous_summary: str = "",
+                           attempt: int = 1, retry_limit: int | None = None) -> str:
+    """由审核 Agent 生成累计失败诊断；任何诊断故障都降级，不阻断重试。"""
+    previous = _failure_summary_obj(previous_summary)
+    limit = max(1, int(retry_limit or settings.FAILURE_RETRY_LIMIT or 5))
+    cfg = pick_model(db, project.user_id, "review")
+    if cfg is None:
+        return json.dumps(_fallback_failure_diagnosis(
+            current_error, failure_digest, previous, attempt), ensure_ascii=False)
+    payload = {
+        "attempt": attempt,
+        "retry_limit": limit,
+        "task": {
+            "title": task.title,
+            "type": task.task_type,
+            "instruction": task.instruction[:8000],
+        },
+        "current_error": str(current_error or "")[:4000],
+        "failure_digest": str(failure_digest or "")[:6000],
+        "review_context": str(review_context or "")[:6000],
+        "previous_diagnosis": previous,
+    }
+    try:
+        raw = await chat_completion(
+            cfg,
+            [
+                {"role": "system", "content": FAILURE_DIAGNOSIS_GOAL},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            timeout=settings.LLM_REQUEST_TIMEOUT,
+        )
+        text = str(raw or "").strip()
+        start, end = text.find("{"), text.rfind("}")
+        obj = json.loads(text[start:end + 1]) if start >= 0 and end > start else {}
+        if (not isinstance(obj, dict)
+                or not all(isinstance(obj.get(key), list)
+                           for key in ("root_causes", "fix_strategies", "failed_approaches", "must_verify"))
+                or not obj.get("root_causes") or not obj.get("fix_strategies")):
+            raise ValueError("失败诊断返回结构不完整")
+        merged = {
+            "attempt": attempt,
+            "root_causes": _merge_failure_items(
+                previous.get("root_causes", []), [str(v) for v in obj.get("root_causes", [])]),
+            "fix_strategies": _merge_failure_items(
+                previous.get("fix_strategies", []), [str(v) for v in obj.get("fix_strategies", [])]),
+            "failed_approaches": _merge_failure_items(
+                previous.get("failed_approaches", []),
+                [str(v) for v in obj.get("failed_approaches", [])],
+                [re.sub(r"^\s*-\s*", "", line).strip()
+                 for line in str(failure_digest or "").splitlines() if line.strip()][-3:]),
+            "must_verify": _merge_failure_items(
+                previous.get("must_verify", []), [str(v) for v in obj.get("must_verify", [])]),
+        }
+        return json.dumps(merged, ensure_ascii=False)
+    except Exception:
+        logger.warning("failure diagnosis failed; using deterministic fallback", exc_info=True)
+        return json.dumps(_fallback_failure_diagnosis(
+            current_error, failure_digest, previous, attempt), ensure_ascii=False)
+
+
+def build_retry_prompt(original_prompt: str, failure_summary: str) -> str:
+    """保留用户原始要求，并追加累计诊断作为下一轮强制修正约束。"""
+    diagnosis = failure_summary_text(failure_summary)
+    if not diagnosis:
+        return str(original_prompt or "")
+    block = (
+        "【自动失败诊断】\n"
+        f"{diagnosis}\n"
+        "请先解决上述根因，不要重复已失败做法；完成成果并通过自检后再提交。"
+    )
+    original = str(original_prompt or "").strip()
+    return f"{original}\n\n{block}" if original else block
+
+
+def previous_failure_summary(db: Session, task: ChapterTask) -> str:
+    row = db.scalars(
+        select(ModuleContent)
+        .where(ModuleContent.chapter_task_id == task.id,
+               ModuleContent.status == "failed",
+               ModuleContent.failure_summary != "")
+        .order_by(ModuleContent.version.desc())
+    ).first()
+    return (row.failure_summary or "") if row is not None else ""
+
+
 def _next_version(db: Session, task_id: int) -> int:
     versions = db.scalars(
         select(ModuleContent.version).where(ModuleContent.chapter_task_id == task_id)
@@ -1032,6 +1236,7 @@ def _save_content(
     status: str = "ok",
     error_msg: str = "",
     failure_digest: str = "",
+    failure_summary: str = "",
 ) -> ModuleContent:
     db.scalar(select(ChapterTask).where(ChapterTask.id == task.id).with_for_update())
     project = db.get(Project, task.project_id)
@@ -1052,6 +1257,7 @@ def _save_content(
         status=status,
         error_msg=error_msg,
         failure_digest=failure_digest,
+        failure_summary=failure_summary,
         is_current=status == "ok",
     )
     db.add(row)
@@ -1423,7 +1629,8 @@ def _draw_verified_chart(fig, ax, chart_data: dict, instruction: str, *, documen
 
 
 async def generate_task(db: Session, project: Project, task: ChapterTask,
-                        user_prompt: str = "", run_token: str | None = None) -> ModuleContent:
+                        user_prompt: str = "", run_token: str | None = None,
+                        failure_summary: str = "") -> ModuleContent:
     """准备、生成和持久化均记录失败；只有有效运行能够提交新版本。"""
     if task.task_type == "heading":
         raise ValueError("标题节点不需要生成内容")
@@ -1453,8 +1660,9 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
         references, data_summary = build_materials(db, project)
         workdir, data_names = _prepare_workdir(db, project, task, run_token)
         failure_memory = _previous_failure_memory(db, task)
+        effective_prompt = build_retry_prompt(user_prompt, failure_summary)
         goal = (GOAL_BY_TYPE[task.task_type]
-                .replace("{extra}", _extra(user_prompt, failure_memory)).replace("{path}", path)
+                .replace("{extra}", _extra(effective_prompt, failure_memory)).replace("{path}", path)
                 .replace("{instruction}", task.instruction + source_context)
                 .replace("{data_files}", "、".join(data_names) or "（无）")
                 .replace("{references}", references).replace("{data_summary}", data_summary))
@@ -1538,7 +1746,8 @@ async def generate_task(db: Session, project: Project, task: ChapterTask,
         row = _save_content(db, task, task.task_type, "", "", user_prompt,
                             agent_type, model_name, int(time.time() - started), status="failed",
                             error_msg=f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"[:500],
-                            failure_digest=(getattr(exc, "failure_digest", "") or "")[:6000])
+                            failure_digest=(getattr(exc, "failure_digest", "") or "")[:6000],
+                            failure_summary=(failure_summary or "")[:12000])
         task.status = "failed"
         db.commit()
         return row

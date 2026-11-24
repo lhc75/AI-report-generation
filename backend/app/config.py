@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     # 生成
     GENERATE_CONCURRENCY: int = 5  # 同时执行的生成任务上限，超出排队
     REVIEW_CONCURRENCY: int = 5  # 导出前逐模块 AI 复核的并发上限（网关不稳时可调小）
+    FAILURE_RETRY_LIMIT: int = 5  # 首次失败后，单模块最多自动诊断并重试的次数
     # ReAct 智能体：默认不设轮次上限（0），由时间预算与卡死检测终止；旧配置可继续设正整数作硬上限。
     REACT_MAX_TURNS: int = 0  # ReAct 单任务最大思考-行动轮次；0 = 不限制
     REACT_MAX_SECONDS: float = 3600.0  # 单任务实际运行时间上限（秒），0 关闭；防止无限重试烧额度
@@ -59,8 +60,6 @@ class Settings(BaseSettings):
     # 导出前审核与自动修复：与生成统一为智能体循环，默认不设轮次上限。
     REVIEW_MAX_ROUNDS: int = 0  # 逐模块/整稿修复轮次上限；0 = 不限制，由时间与无进展检测终止
     REVIEW_MAX_SECONDS: float = 5400.0  # 导出前审核+修复总时长预算（秒），0 关闭
-    REVIEW_NO_PROGRESS_LIMIT: int = 3  # 同一批 error 连续多轮未改善时停止，避免无效消耗
-    REVIEW_MAX_TASK_REGENS: int = 4  # 单个模块在导出审核中最多自动重生成次数
     REVIEW_MODULE_ATTEMPTS: int = 3  # 单个模块复核 ReAct 异常后的重试次数
     # ReAct 上下文保护：接近模型窗口时自动压缩历史（东亚字符按 1 token 保守估计）
     REACT_CONTEXT_WINDOW_TOKENS: int = 128000  # 模型上下文窗口（token），按实际模型调整

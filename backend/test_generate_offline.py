@@ -199,7 +199,8 @@ def main():
         check(False, "生成期间不应删除模块")
     original_generate = generate.generate_task
 
-    async def fake_generate(task_db, task_project, task, user_prompt="", run_token=None):
+    async def fake_generate(task_db, task_project, task, user_prompt="", run_token=None,
+                            failure_summary=""):
         task.status = "done"
         task_db.commit()
 

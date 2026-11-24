@@ -157,6 +157,8 @@ class ModuleContent(Base):
     # 失败过程摘要（最近几轮的具体错误与最后动作），下一次生成时注入提示词；
     # 与 error_msg 分开存放，避免界面提示被长文本淹没。
     failure_digest: Mapped[str] = mapped_column(Text, default="")
+    # 审核 Agent 对累计失败原因和修正策略的结构化诊断（JSON 文本）。
+    failure_summary: Mapped[str] = mapped_column(Text, default="")
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 

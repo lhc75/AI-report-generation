@@ -3,7 +3,9 @@ import asyncio
 import json
 import time
 
-from app import review
+import pytest
+
+from app import generate, review
 from app.config import settings
 from app.models import ChapterTask, ModelConfig, ModuleContent
 
@@ -12,6 +14,20 @@ def _review_config(db, user):
     db.add(ModelConfig(user_id=user.id, name="审核", agent_type="", base_url="http://offline",
                        api_key_enc="enc", model="offline", is_default=True))
     db.commit()
+
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_failure_diagnosis(monkeypatch):
+    async def fake_diagnosis(*_args, attempt=1, **_kwargs):
+        return json.dumps({
+            "attempt": attempt,
+            "root_causes": ["测试失败根因"],
+            "fix_strategies": ["按审核意见修正"],
+            "failed_approaches": ["原样重试"],
+            "must_verify": ["重新提交前自检"],
+        }, ensure_ascii=False)
+    monkeypatch.setattr(generate, "diagnose_failure", fake_diagnosis)
 
 
 def _seed_task(db, item, index):
@@ -112,7 +128,8 @@ def test_repair_regenerations_run_parallel_and_report_progress(project, db, monk
         return {"status": "issues", "repairs": [],
                 "issues": [{"severity": "error", "message": "数字与数据不符"}]}
 
-    async def fake_regenerate(_db, _project, task, user_prompt="", run_token=None):
+    async def fake_regenerate(_db, _project, task, user_prompt="", run_token=None,
+                              failure_summary=""):
         state["active"] += 1
         state["peak"] = max(state["peak"], state["active"])
         try:
@@ -141,9 +158,9 @@ def test_repair_regenerations_run_parallel_and_report_progress(project, db, monk
     assert result["ok"], result
     assert 2 <= state["peak"] <= 3, f"重生成并发峰值 {state['peak']} 超出限制"
     assert elapsed < 6 * 0.2 * 0.9, f"重生成未并行：{elapsed:.2f}s"
-    repair_calls = [entry for entry in progress if entry[1] == "定向修正/重新生成"]
-    assert repair_calls[0] == ("repair", "定向修正/重新生成", 0, 6)
-    assert repair_calls[-1] == ("repair", "定向修正/重新生成", 6, 6)
+    repair_calls = [entry for entry in progress if entry[1] == "失败诊断/自动重试"]
+    assert repair_calls[0] == ("repair", "失败诊断/自动重试", 0, 6)
+    assert repair_calls[-1] == ("repair", "失败诊断/自动重试", 6, 6)
     counts = [entry[2] for entry in repair_calls]
     assert counts == sorted(counts) and counts[-1] == 6
 
@@ -187,7 +204,8 @@ def test_recheck_runs_with_progress_and_refreshes_results(project, db, monkeypat
                  "message": "两模块数字冲突"}], "repairs": []}
         return {"status": "ok", "issues": [], "repairs": []}
 
-    async def regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                         failure_summary=""):
         _db.query(Row).filter(Row.chapter_task_id == task_.id).update({"is_current": False})
         content = ("修正后的正文" + "字" * 60 if task_.task_type == "text"
                    else "修正后的图表数据 " + json.dumps(

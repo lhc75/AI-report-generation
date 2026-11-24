@@ -96,7 +96,7 @@ function collectColumns(nodes = []) {
 }
 async function htmlFor(model) {
   const app = Vue.createSSRApp({ setup: () => model, render })
-  for (const name of ['ElButton', 'ElUpload', 'ElRow', 'ElCol', 'ElIcon', 'ElTag', 'ElAlert', 'ElTooltip', 'ElDialog', 'ElSelect', 'ElOption', 'ElInput', 'ElEmpty', 'ElTableColumn', 'ElForm', 'ElFormItem', 'Document']) {
+  for (const name of ['ElButton', 'ElUpload', 'ElRow', 'ElCol', 'ElIcon', 'ElTag', 'ElAlert', 'ElTooltip', 'ElDialog', 'ElSelect', 'ElOption', 'ElInput', 'ElEmpty', 'ElTableColumn', 'ElForm', 'ElFormItem', 'ElProgress', 'Document']) {
     app.component(name, simpleComponent(name, name === 'ElButton' ? 'button' : 'div'))
   }
   app.component('ElTable', Vue.defineComponent({
@@ -116,7 +116,8 @@ test('history remains accessible with no current version and failed latest conte
     versions: history,
     content: options.params.content_id === 1
       ? { id: 1, status: 'ok', is_current: false, content_type: 'text', content: 'old successful content' }
-      : { id: 2, status: 'failed', error_msg: 'provider timeout', is_current: false },
+      : { id: 2, status: 'failed', error_msg: 'provider timeout', is_current: false,
+          failure_summary: '【根因】\n- 未生成 out/chart.png\n【修正策略】\n- 先运行绘图代码' },
   } }) })
   const row = { id: 1, task_type: 'text', status: 'failed', has_content: false, history_count: 2 }
   setup.model.chapters.value = [row]
@@ -124,11 +125,24 @@ test('history remains accessible with no current version and failed latest conte
   await setup.model.openContent(row)
   assert.equal(setup.model.versions.value.length, 2)
   assert.match(await htmlFor(setup.model), /provider timeout/)
+  assert.match(await htmlFor(setup.model), /失败诊断（系统总结）/)
+  assert.match(await htmlFor(setup.model), /未生成 out\/chart\.png/)
   setup.model.contentDetail.value = null
   assert.match(await htmlFor(setup.model), /v2/)
   await setup.model.openContent(row, 1)
   assert.match(await htmlFor(setup.model), /old successful content/)
   assert.match(await htmlFor(setup.model), /回退到此版本/)
+  setup.unmount()
+})
+
+test('generating progress shows failure diagnosis and retry status', async () => {
+  const setup = harness()
+  setup.model.project.value = {
+    id: 1, status: 'generating', operation_token: 'run-1', error_msg: '', report_path: '',
+    progress: { label: '调查结果：失败诊断（第 2 次）', percent: 91, done: 1, total: 5 },
+  }
+  const html = await htmlFor(setup.model)
+  assert.match(html, /调查结果：失败诊断（第 2 次） 1\/5/)
   setup.unmount()
 })
 

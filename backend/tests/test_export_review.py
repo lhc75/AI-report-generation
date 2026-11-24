@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import review
+from app import generate, review
 from app.models import ChapterTask, ModelConfig, ModuleContent
 
 
@@ -14,6 +14,20 @@ def _review_config(db, user):
     db.add(ModelConfig(user_id=user.id, name="审核", agent_type="", base_url="http://offline",
                        api_key_enc="enc", model="offline", is_default=True))
     db.commit()
+
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_failure_diagnosis(monkeypatch):
+    async def fake_diagnosis(*_args, attempt=1, **_kwargs):
+        return json.dumps({
+            "attempt": attempt,
+            "root_causes": ["测试失败根因"],
+            "fix_strategies": ["按审核意见修正"],
+            "failed_approaches": ["原样重试"],
+            "must_verify": ["重新提交前自检"],
+        }, ensure_ascii=False)
+    monkeypatch.setattr(generate, "diagnose_failure", fake_diagnosis)
 
 
 def _seed_content(db, item, task, content, review_record=None):
@@ -108,7 +122,8 @@ def test_error_without_repair_regenerates_and_passes(project, db, monkeypatch):
                     "repairs": []}
         return {"status": "ok", "issues": [], "repairs": []}
 
-    async def regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                         failure_summary=""):
         assert "审核意见" in user_prompt
         assert "一律以复算为准" in user_prompt
         _db.query(ModuleContent).filter(
@@ -142,7 +157,8 @@ def test_error_without_repair_blocks_export_when_regeneration_fails(project, db,
                 "issues": [{"severity": "error", "message": "数字无法从数据复算"}],
                 "repairs": []}
 
-    async def fail_regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def fail_regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                              failure_summary=""):
         regenerated.append(task_.id)
         return SimpleNamespace(status="failed", error_msg="模拟重新生成失败")
 
@@ -173,7 +189,8 @@ def test_final_review_error_regenerates_target_and_passes(project, db, monkeypat
                 "repairs": []}
         return {"status": "ok", "issues": [], "repairs": []}
 
-    async def regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                         failure_summary=""):
         assert "审核意见" in user_prompt
         _db.query(ModuleContent).filter(
             ModuleContent.chapter_task_id == task_.id).update({"is_current": False})
@@ -228,7 +245,8 @@ def test_final_review_conflict_regenerates_all_referenced_modules(project, db, m
             }], "repairs": []}
         return {"status": "ok", "issues": [], "repairs": []}
 
-    async def regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                         failure_summary=""):
         state["regenerated"].append(task_.id)
         assert "审核意见" in user_prompt
         _db.query(ModuleContent).filter(
@@ -307,7 +325,8 @@ def test_final_review_repair_needs_unique_fragment_then_regenerates(project, db,
                                  "old": "正文", "new": "正文二", "cell": ""}]}
         return {"status": "ok", "issues": [], "repairs": []}
 
-    async def regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                         failure_summary=""):
         state["prompts"].append(user_prompt)
         _db.query(ModuleContent).filter(
             ModuleContent.chapter_task_id == task_.id).update({"is_current": False})
@@ -495,7 +514,8 @@ def test_missing_content_blocks_export(project, db, monkeypatch):
     item, task, user = project
     _review_config(db, user)
 
-    async def fail_regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def fail_regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                              failure_summary=""):
         return SimpleNamespace(status="failed", error_msg="没有可用的生成环境")
 
     monkeypatch.setattr(review.generate, "generate_task", fail_regenerate)
@@ -518,7 +538,8 @@ def test_empty_content_regenerates_even_with_stale_ok_cache(project, db, monkeyp
         assert (row_.content or "").strip(), "空内容不应进入模型复核"
         return {"status": "ok", "issues": [], "repairs": []}
 
-    async def regenerate(_db, _project, task_, user_prompt="", run_token=None):
+    async def regenerate(_db, _project, task_, user_prompt="", run_token=None,
+                         failure_summary=""):
         state["regenerated"] += 1
         assert "内容为空" in user_prompt
         _db.query(ModuleContent).filter(

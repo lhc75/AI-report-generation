@@ -783,8 +783,10 @@ def edit_task(project_id: int, task_id: int, data: TaskEditIn,
     return result
 
 
-async def run_generate_one(project_id: int, task_id: int, user_prompt: str = "",
-                           run_token: str | None = None, finish: bool = True) -> None:
+async def _run_generate_attempt(project_id: int, task_id: int, user_prompt: str,
+                               run_token: str | None,
+                               failure_summary: str = "") -> tuple[bool, object | None, str, str]:
+    """执行一次完整生成尝试；返回（是否成功、内容行、错误、失败摘要证据）。"""
     async with gen_semaphore():
         db = SessionLocal()
         try:
@@ -792,10 +794,18 @@ async def run_generate_one(project_id: int, task_id: int, user_prompt: str = "",
             task = db.get(ChapterTask, task_id)
             if task is None:
                 raise ValueError("生成任务已不存在")
-            await generate.generate_task(db, project, task, user_prompt, run_token=run_token)
+            row = await generate.generate_task(
+                db, project, task, user_prompt, run_token=run_token,
+                failure_summary=failure_summary)
+            if row is not None and row.status == "ok":
+                return True, row, "", ""
+            if row is not None:
+                return False, row, str(row.error_msg or "生成失败"), str(row.failure_digest or "")
+            return False, None, "生成任务未返回结果", ""
         except Exception as exc:
-            logger.exception("run_generate_one failed")
+            logger.exception("generate attempt failed")
             db.rollback()
+            error = f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"
             try:
                 operations.ensure_run(db, project_id, run_token)
                 task = db.get(ChapterTask, task_id)
@@ -804,12 +814,77 @@ async def run_generate_one(project_id: int, task_id: int, user_prompt: str = "",
                     db.commit()
             except RuntimeError:
                 db.rollback()
+            return False, None, error, getattr(exc, "failure_digest", "") or ""
         finally:
             db.close()
-            if finish and run_token:
-                _finish_generation(project_id, run_token, [task_id])
             operations.drain_cleanup()
 
+
+async def run_generate_one(project_id: int, task_id: int, user_prompt: str = "",
+                           run_token: str | None = None, finish: bool = True) -> object | None:
+    """统一生成入口：首次失败后由审核 Agent 累计诊断，并最多重试 5 次。"""
+    retry_limit = max(0, int(settings.FAILURE_RETRY_LIMIT or 0))
+    original_prompt = str(user_prompt or "").strip()
+    summary = ""
+    task_title = f"任务 {task_id}"
+    with SessionLocal() as db:
+        try:
+            task = db.get(ChapterTask, task_id)
+            if task is not None:
+                task_title = task.title
+                summary = generate.previous_failure_summary(db, task)
+        except Exception:
+            logger.warning("读取上次失败诊断失败", exc_info=True)
+    result = None
+    try:
+        for retry_no in range(retry_limit + 1):
+            operations.report_progress(
+                project_id, run_token, phase="generate",
+                label=(f"{task_title[:36]}：自动重试 {retry_no}/{retry_limit}"
+                       if retry_no else f"{task_title[:36]}：生成"),
+                done=retry_no, total=retry_limit + 1)
+            ok, result, error, digest = await _run_generate_attempt(
+                project_id, task_id, original_prompt, run_token, summary)
+            if ok:
+                return result
+            if not generate.is_retryable_failure(error):
+                logger.warning("模块 %s 遇到不可重试错误：%s", task_id, error[:300])
+                return result
+            if retry_no >= retry_limit:
+                break
+            operations.report_progress(
+                project_id, run_token, phase="generate",
+                label=f"{task_title[:36]}：失败诊断（第 {retry_no + 1} 次）",
+                done=retry_no, total=retry_limit + 1)
+            try:
+                with SessionLocal() as db:
+                    project = operations.ensure_run(db, project_id, run_token, lock=False)
+                    task = db.get(ChapterTask, task_id)
+                    if task is None:
+                        break
+                    latest = db.scalars(
+                        select(ModuleContent)
+                        .where(ModuleContent.chapter_task_id == task_id,
+                               ModuleContent.status == "failed")
+                        .order_by(ModuleContent.version.desc())
+                    ).first()
+                    summary = await generate.diagnose_failure(
+                        db, project, task, current_error=error,
+                        failure_digest=digest,
+                        previous_summary=summary,
+                        attempt=retry_no + 1, retry_limit=retry_limit)
+                    if latest is not None:
+                        latest.failure_summary = summary[:12000]
+                        db.commit()
+            except RuntimeError:
+                return result
+            except Exception:
+                logger.warning("模块 %s 失败诊断写入异常", task_id, exc_info=True)
+        return result
+    finally:
+        if finish and run_token:
+            _finish_generation(project_id, run_token, [task_id])
+        operations.drain_cleanup()
 
 def _finish_generation(project_id: int, run_token: str, task_ids: list[int]) -> None:
     with SessionLocal() as db:
@@ -818,7 +893,7 @@ def _finish_generation(project_id: int, run_token: str, task_ids: list[int]) -> 
         failed = len(task_ids) - succeeded
     operations.finish_run(project_id, run_token, "analyzed", {
         "succeeded": succeeded, "failed": failed, "total": len(task_ids),
-        "message": f"生成完成：成功 {succeeded} 个，失败 {failed} 个，请查看失败详情并重试" if failed else "",
+        "message": f"生成完成：成功 {succeeded} 个，失败 {failed} 个；失败模块已完成自动诊断和最多 {settings.FAILURE_RETRY_LIMIT} 次重试，请查看失败诊断" if failed else "",
     })
 
 
@@ -896,6 +971,7 @@ def content_to_dict(c: ModuleContent, with_body: bool) -> dict:
         "prompt": c.prompt,
         "status": c.status,
         "error_msg": c.error_msg,
+        "failure_summary": generate.failure_summary_text(c.failure_summary),
         "is_current": c.is_current,
         "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S"),
     }
