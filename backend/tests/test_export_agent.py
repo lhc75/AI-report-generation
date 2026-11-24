@@ -79,6 +79,22 @@ def test_normalize_chart_captions_saves_new_version(project, db):
     current = review._current_contents(db, item.id)[image_task.id]
     assert current.version == 2
     assert json.loads(current.content)["caption"] == "图2.7-1 满意度分布"
+    assert db.get(ChapterTask, image_task.id).status == "done"
+
+
+def test_targeted_repair_marks_task_done(project, db):
+    item, task, _user = project
+    task.status = "failed"
+    _seed_content(db, item, task, "旧表述只出现一次。" + "其余正文保持不变。" * 20)
+    db.commit()
+    applied = review._apply_repairs(db, item, [{
+        "task_id": task.id,
+        "type": "text",
+        "old": "旧表述",
+        "new": "新表述",
+    }], "offline")
+    assert task.id in applied
+    assert db.get(ChapterTask, task.id).status == "done"
 
 
 def test_issue_signature_ignores_warnings_and_order():

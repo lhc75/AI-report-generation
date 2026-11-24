@@ -751,6 +751,7 @@ def _apply_repairs(db: Session, project: Project, repairs: list[dict[str, Any]],
             db, task, row.content_type, content, row.image_path,
             "导出审核自动修正", "review", model, 0,
         )
+        task.status = "done"
         applied.add(task_id)
     if applied:
         db.commit()
@@ -842,6 +843,7 @@ def _normalize_chart_captions(db: Session, project: Project,
         generate._save_content(
             db, task, task.task_type, normalized, row.image_path,
             "导出前确定性规范化（图号/表号/题号）", "review", "", 0)
+        task.status = "done"
         changed = True
     if changed:
         db.commit()
