@@ -354,11 +354,10 @@ def publish_modern(path, red_path, report_id, document, checkpoint, notice):
 async def process_modern_report(report_id, options, config, path, modern):
     level, org, outline, facts = options["level"], options["org"], modern["outline"], modern["facts"]
     missing, checkpoint = modern["missing"], dict(modern["draft"])
-    report_missing = ([{key: item.get(key, "") for key in ("name", "source", "reason")} for item in missing] +
-                      [{key: item.get(key, "") for key in ("name", "source", "reason")}
-                       for item in modern["annual"] if item["reason"]])
+    report_missing = [{key: item.get(key, "") for key in ("name", "source", "reason")}
+                      for item in missing + [item for item in modern["annual"] if item["reason"]]]
     checkpoint["missing"] = report_missing
-    write_args = {"level": level, "org": org, "outline": outline, "facts": facts, "missing": missing}
+    write_args = {"level": level, "org": org, "outline": outline, "facts": facts, "missing": report_missing}
     notices = list(checkpoint.get("notices", []))
     if "analysis" not in checkpoint:
         try:
@@ -379,7 +378,7 @@ async def process_modern_report(report_id, options, config, path, modern):
         checkpoint["notices"] = notices
         await asyncio.to_thread(save_report_checkpoint, report_id, checkpoint)
     if "approved" not in checkpoint:
-        review_args = {"level": level, "outline": outline, "facts": facts}
+        review_args = {"level": level, "outline": outline, "facts": facts, "missing": report_missing}
         try:
             candidate = checkpoint["body"]
             approved, feedback = await review_sections(modern["review_model"], **review_args, draft=candidate)

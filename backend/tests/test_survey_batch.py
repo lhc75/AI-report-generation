@@ -291,10 +291,12 @@ def test_one_click_annual_rules_fixed_outlines_and_resumable_documents(client, d
         files={"file": ("省级模板.docx", docx_template("{{报告标题}}", "{{报告正文}}"))}))
     successful(http.put(f"{base}/templates/{province_template['id']}", json={"title_index": 1, "body_index": 2}))
     corrections = []
-    stage_calls = {"outline": 0, "approved": 0, "red": 0}
+    stage_calls = {"outline": 0, "approved": 0, "red": 0, "rewritten": 0}
+    reviewed_province = False
     actor_by_level = survey_authoring.ACTORS
 
     async def fake_model(_config, messages, **_kwargs):
+        nonlocal reviewed_province
         payload = json.loads(messages[1]["content"])
         if "指标资料" in payload:
             ids = {row["title"]: row["id"] for row in payload["题库"] if row["questionnaire"] == "学生"}
@@ -323,7 +325,16 @@ def test_one_click_annual_rules_fixed_outlines_and_resumable_documents(client, d
                                             for key, title, _ in payload["章节要求"]]}, ensure_ascii=False)
         if "正文" in payload:
             stage_calls["approved"] += 1
+            if level == "province" and not reviewed_province:
+                reviewed_province = True
+                definitions = [entry["methodology"] for entry in payload["证据"].values() if "methodology" in entry]
+                assert definitions[0]["numerator"] == 1 and definitions[0]["denominator"] == 2
+                assert "两倍" in definitions[1]["definition"]
+                return '{"approved":false,"issues":["按已核验的口径说明综合分"]}'
             return '{"approved":true,"issues":[]}'
+        if payload.get("审核意见"):
+            assert payload["审核意见"] == "按已核验的口径说明综合分"
+            stage_calls["rewritten"] += 1
         if payload["任务"] == "红字解析":
             stage_calls["red"] += 1
         return json.dumps({"sections": [
@@ -356,7 +367,8 @@ def test_one_click_annual_rules_fixed_outlines_and_resumable_documents(client, d
     assert batch["counts"] == {"queued": 0, "running": 0, "done": 8, "failed": 0}, batch
     assert len(corrections) == 2 and "筛选选项" in corrections[1]
     assert batch["generation"]["missing"][0]["reason"] == "答卷中缺少培训学时题"
-    assert stage_calls["outline"] == 4 and stage_calls["approved"] == 8 and stage_calls["red"] > 8
+    assert stage_calls["outline"] == 4 and stage_calls["approved"] == 9 and stage_calls["red"] > 8
+    assert stage_calls["rewritten"] == 1
     outlines = {}
     red_texts = {}
     province_id = None
