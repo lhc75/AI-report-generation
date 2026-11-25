@@ -79,3 +79,28 @@ class SurveyReport(Base):
     state: Mapped[str] = mapped_column(String(16), index=True, default="queued")
     error: Mapped[str] = mapped_column(Text, default="")
     notice: Mapped[str] = mapped_column(String(255), default="")
+
+
+class SurveyBatchPreparation(Base):
+    __tablename__ = "survey_batch_preparation"
+
+    id: Mapped[int] = mapped_column(ForeignKey("survey_batch.id"), primary_key=True, autoincrement=False)
+    state: Mapped[str] = mapped_column(String(16), index=True, default="queued")
+    checkpoint: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
+class SurveyReportDraft(Base):
+    __tablename__ = "survey_report_draft"
+
+    id: Mapped[int] = mapped_column(ForeignKey("survey_report.id"), primary_key=True, autoincrement=False)
+    checkpoint: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SurveyAnalysisPhrase(Base):
+    __tablename__ = "survey_analysis_phrase"
+
+    batch_id: Mapped[int] = mapped_column(ForeignKey("survey_batch.id"), primary_key=True)
+    level: Mapped[str] = mapped_column(String(16), primary_key=True)
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("survey_report.id"), index=True)

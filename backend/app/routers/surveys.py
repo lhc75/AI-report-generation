@@ -26,10 +26,11 @@ from ..deps import get_current_user
 from ..llm import allow_model_failover, chat_completion
 from ..models import User
 from ..survey_data import Level, SheetMapping, inspect_workbook, open_index
-from ..survey_models import SurveyAsset, SurveyBatch, SurveyDataset, SurveyIndicatorVersion, SurveyProject, SurveyReport
+from ..survey_models import (SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyIndicatorVersion,
+                             SurveyProject, SurveyReport, SurveyReportDraft)
 from ..survey_reports import (WORD_TYPE, BatchSettings, IndicatorRule, check_rules, preview_reports, question_catalog,
                               question_options, safe_filename, scope_catalog, template_preview)
-from ..survey_worker import index_path, model_for, project_dir, report_path
+from ..survey_worker import analysis_path, index_path, model_for, project_dir, report_path
 
 router = APIRouter(prefix="/api/surveys", tags=["survey"])
 MAX_UPLOAD = 200 * 1024 * 1024
@@ -333,6 +334,9 @@ def save_indicators(project_id: int, data: IndicatorInput, user: User = Depends(
 
 
 def plan(db, project_id, data):
+    for asset_id in data.indicator_assets:
+        if belongs(db, SurveyAsset, asset_id, project_id).kind != "indicator":
+            raise HTTPException(422, "请选择年度指标资料")
     if data.indicator_id is not None:
         rule_set = belongs(db, SurveyIndicatorVersion, data.indicator_id, project_id)
         if rule_set.dataset_id != data.dataset_id:
@@ -358,6 +362,19 @@ def preview(project_id: int, data: BatchSettings, user: User = Depends(get_curre
 def submit(project_id: int, data: SubmitInput, user: User = Depends(get_current_user),
            db: Session = Depends(get_db)):
     owned(db, project_id, user)
+    return save_batch(db, project_id, data.model_copy(update={"automatic": False, "indicator_assets": []}))
+
+
+@router.post("/{project_id}/generate")
+def generate(project_id: int, data: SubmitInput, user: User = Depends(get_current_user),
+             db: Session = Depends(get_db)):
+    owned(db, project_id, user)
+    if data.indicator_assets and data.indicator_id:
+        raise HTTPException(422, "年度指标资料和已确认的指标版本请选择其中一项")
+    return save_batch(db, project_id, data.model_copy(update={"automatic": True}))
+
+
+def save_batch(db, project_id, data):
     request_id = str(data.request_id)
     request_lookup = select(SurveyBatch).where(SurveyBatch.project_id == project_id, SurveyBatch.request_id == request_id)
     if existing := db.scalar(request_lookup):
@@ -367,11 +384,15 @@ def submit(project_id: int, data: SubmitInput, user: User = Depends(get_current_
         raise HTTPException(422, "所选范围没有可生成的报告")
     row = SurveyBatch(project_id=project_id, dataset_id=data.dataset_id, indicator_id=data.indicator_id,
                       request_id=request_id, config={"selection": data.model_dump(mode="json", exclude={"request_id"}),
-                                                     "levels": summary["levels"]})
+                                                     "levels": summary["levels"],
+                                                     "indicator_assets": list(dict.fromkeys(data.indicator_assets))})
     db.add(row)
     try:
         db.flush()
-        db.add_all(SurveyReport(batch_id=row.id, **job) for job in jobs)
+        state = "waiting" if data.automatic else "queued"
+        db.add_all(SurveyReport(batch_id=row.id, state=state, **job) for job in jobs)
+        if data.automatic:
+            db.add(SurveyBatchPreparation(id=row.id, checkpoint={"stage": "解析年度指标"}))
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -384,9 +405,17 @@ def submit(project_id: int, data: SubmitInput, user: User = Depends(get_current_
 def batch_summary(db, batch):
     counts = dict(db.execute(select(SurveyReport.state, func.count()).where(
         SurveyReport.batch_id == batch.id).group_by(SurveyReport.state)).all())
+    preparation = db.get(SurveyBatchPreparation, batch.id)
+    generation = None
+    if preparation:
+        generation = {"state": preparation.state, "stage": preparation.checkpoint.get("stage"),
+                      "error": preparation.error, "indicator_assets": batch.config.get("indicator_assets", []),
+                      "missing": preparation.checkpoint.get("missing", []),
+                      "notices": preparation.checkpoint.get("notices", {})}
+    counts["queued"] = counts.get("queued", 0) + counts.pop("waiting", 0)
     return {"id": batch.id, "dataset_id": batch.dataset_id, "created_at": batch.created_at,
             "counts": {state: counts.get(state, 0) for state in ("queued", "running", "done", "failed")},
-            "total": sum(counts.values()), "levels": batch.config["levels"]}
+            "total": sum(counts.values()), "levels": batch.config["levels"], "generation": generation}
 
 
 @router.get("/{project_id}/batches")
@@ -404,14 +433,34 @@ def batch_detail(project_id: int, batch_id: int, state: str | None = None, offse
     batch = belongs(db, SurveyBatch, batch_id, project_id)
     query = select(SurveyReport).where(SurveyReport.batch_id == batch_id)
     if state:
-        query = query.where(SurveyReport.state == state)
+        query = query.where(SurveyReport.state.in_(("queued", "waiting")) if state == "queued" else SurveyReport.state == state)
     with dataset(db, project_id, batch.dataset_id) as index:
         questionnaires = {row[0]: row[1] for row in index.execute("SELECT id,name FROM questionnaire")}
-    rows = db.scalars(query.order_by(SurveyReport.id).offset(max(0, offset)).limit(50))
-    return {**batch_summary(db, batch), "reports": [
+    rows = db.scalars(query.order_by(SurveyReport.id).offset(max(0, offset)).limit(50)).all()
+    summary = batch_summary(db, batch)
+    drafts = {}
+    if summary["generation"] and rows:
+        drafts = {draft.id: draft.checkpoint for draft in db.scalars(
+            select(SurveyReportDraft).where(SurveyReportDraft.id.in_([row.id for row in rows])))}
+    return {**summary, "reports": [
         {"id": row.id, "org_path": row.org_path, "org_id": row.org_id, "org_level": row.org_level,
          "questionnaires": [questionnaires[qid] for qid in row.questionnaires],
-         "state": row.state, "error": row.error, "notice": row.notice} for row in rows]}
+         "state": "queued" if row.state == "waiting" else row.state, "error": row.error, "notice": row.notice,
+         "missing": drafts.get(row.id, {}).get("missing", []),
+         "analysis": bool(summary["generation"] and row.state == "done")} for row in rows]}
+
+
+@router.post("/{project_id}/batches/{batch_id}/retry")
+def retry_preparation(project_id: int, batch_id: int, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    owned(db, project_id, user)
+    belongs(db, SurveyBatch, batch_id, project_id)
+    updated = db.execute(update(SurveyBatchPreparation).where(SurveyBatchPreparation.id == batch_id,
+        SurveyBatchPreparation.state == "failed").values(state="queued", error=""))
+    if not updated.rowcount:
+        raise HTTPException(409, "该批次当前无法重试")
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/{project_id}/batches/{batch_id}/reports/{report_id}/retry")
@@ -441,11 +490,28 @@ def download_report(project_id: int, batch_id: int, report_id: int, user: User =
                         headers={"Cache-Control": "private, no-store"})
 
 
+@router.get("/{project_id}/batches/{batch_id}/reports/{report_id}/analysis")
+def download_analysis(project_id: int, batch_id: int, report_id: int, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    owned(db, project_id, user)
+    belongs(db, SurveyBatch, batch_id, project_id)
+    row = db.get(SurveyReport, report_id)
+    path = analysis_path(project_id, report_id)
+    if not row or row.batch_id != batch_id or row.state != "done" or not path.is_file():
+        raise HTTPException(404, "红字解析尚不可下载")
+    name = safe_filename(row.org_path.rsplit(" / ", 1)[-1])
+    return FileResponse(path, media_type=WORD_TYPE, filename=f"{name}-{report_id}-红字解析.docx",
+                        headers={"Cache-Control": "private, no-store"})
+
+
 @router.get("/{project_id}/batches/{batch_id}/zip")
 def download_zip(project_id: int, batch_id: int, level: Level | None = None, org_id: int | None = None,
-                 part: int = 1, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+                 part: int = 1, analysis: bool = False, user: User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
     owned(db, project_id, user)
     batch = belongs(db, SurveyBatch, batch_id, project_id)
+    if analysis and db.get(SurveyBatchPreparation, batch_id) is None:
+        raise HTTPException(404, "该批次没有红字解析")
     query = select(SurveyReport).where(SurveyReport.batch_id == batch_id)
     if level:
         query = query.where(SurveyReport.org_level == level)
@@ -469,10 +535,12 @@ def download_zip(project_id: int, batch_id: int, level: Level | None = None, org
         with ZipFile(target, "w", ZIP_STORED, allowZip64=True) as bundle:
             for row in rows:
                 filename = safe_filename(row.org_path.rsplit(" / ", 1)[-1])
-                bundle.write(report_path(project_id, row.id), f"{row.org_level}/{filename}-{row.id}.docx")
+                path = analysis_path(project_id, row.id) if analysis else report_path(project_id, row.id)
+                bundle.write(path, f"{row.org_level}/{filename}-{row.id}.docx")
     except Exception:
         target.unlink(missing_ok=True)
         raise
-    return FileResponse(target, media_type="application/zip", filename=f"问卷报告-{batch_id}-第{part}包.zip",
+    label = "红字解析" if analysis else "问卷报告"
+    return FileResponse(target, media_type="application/zip", filename=f"{label}-{batch_id}-第{part}包.zip",
                         background=BackgroundTask(target.unlink, missing_ok=True),
                         headers={"Cache-Control": "private, no-store"})

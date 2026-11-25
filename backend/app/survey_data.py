@@ -153,6 +153,41 @@ CREATE TABLE notice(source TEXT NOT NULL, sheet TEXT NOT NULL, issue TEXT NOT NU
 """
 
 
+def mapped_sheet(sheet, mapping: SheetMapping, source: str):
+    rows = sheet.iter_rows(min_row=mapping.header, values_only=True)
+    headers = next(rows, ())
+    if not headers:
+        raise ValueError(f"{source} / {mapping.sheet} 找不到表头")
+    if set(mapping.fields) - set(ALIASES) or any(i < 0 or i >= len(headers) for i in mapping.fields.values()):
+        raise ValueError(f"{source} / {mapping.sheet} 字段映射超出表头范围")
+    if len(set(mapping.fields.values())) != len(mapping.fields):
+        raise ValueError("同一列只能映射一个组织或问卷字段")
+    if set(mapping.questions) - set(range(len(headers))):
+        raise ValueError("题型映射超出表头范围")
+    samples = list(islice(rows, 256))
+    plan = []
+    for index, value in enumerate(headers):
+        title = clean(value)
+        if (not title or index in mapping.fields.values() or label(title) in METADATA
+                or PRIVATE_HEADER.search(title)):
+            continue
+        rule = mapping.questions.get(index, QuestionRule())
+        if rule.kind == "auto":
+            values = [clean(row[index]) for row in samples if len(row) > index]
+            rule = infer_rule([item for item in values if item not in UNANSWERED], title)
+        if rule.kind != "ignore":
+            plan.append((index, title[:400], rule))
+    return plan, chain(samples, rows)
+
+
+def response_scope(row, mapping, field_indices):
+    city, county, school, code, name = [label(row[i]) if i is not None and i < len(row) else ""
+                                       for i in field_indices]
+    if "questionnaire" not in mapping.fields:
+        name = mapping.questionnaire.strip()
+    return city, county, school, code, name
+
+
 class Importer:
     def __init__(self, db: sqlite3.Connection, province: str):
         self.db = db
@@ -208,30 +243,7 @@ class Importer:
         return survey_id, question_ids
 
     def import_sheet(self, sheet, mapping: SheetMapping, source: str):
-        rows = sheet.iter_rows(min_row=mapping.header, values_only=True)
-        headers = next(rows, ())
-        if not headers:
-            raise ValueError(f"{source} / {mapping.sheet} 找不到表头")
-        if set(mapping.fields) - set(ALIASES) or any(i < 0 or i >= len(headers) for i in mapping.fields.values()):
-            raise ValueError(f"{source} / {mapping.sheet} 字段映射超出表头范围")
-        if len(set(mapping.fields.values())) != len(mapping.fields):
-            raise ValueError("同一列只能映射一个组织或问卷字段")
-        if set(mapping.questions) - set(range(len(headers))):
-            raise ValueError("题型映射超出表头范围")
-        samples = list(islice(rows, 256))
-        plan = []
-        for index, value in enumerate(headers):
-            title = clean(value)
-            if (not title or index in mapping.fields.values() or label(title) in METADATA
-                    or PRIVATE_HEADER.search(title)):
-                continue
-            rule = mapping.questions.get(index, QuestionRule())
-            if rule.kind == "auto":
-                values = [clean(row[index]) for row in samples if len(row) > index]
-                rule = infer_rule([item for item in values if item not in UNANSWERED], title)
-            if rule.kind != "ignore":
-                plan.append((index, title[:400], rule))
-
+        plan, rows = mapped_sheet(sheet, mapping, source)
         sample_count = Counter()
         answers = {}
         options = defaultdict(Counter)
@@ -241,13 +253,10 @@ class Importer:
         bound_surveys = {}
         bound_locations = {}
         field_indices = [mapping.fields.get(key) for key in ("city", "county", "school", "school_id", "questionnaire")]
-        for row in chain(samples, rows):
+        for row in rows:
             if not any(value is not None and value != "" for value in row):
                 continue
-            city, county, school, code, name = [label(row[i]) if i is not None and i < len(row) else ""
-                                               for i in field_indices]
-            if "questionnaire" not in mapping.fields:
-                name = mapping.questionnaire.strip()
+            city, county, school, code, name = response_scope(row, mapping, field_indices)
             if not name:
                 notices["缺少问卷类型，未计入统计"] += 1
                 continue

@@ -31,12 +31,15 @@ class LevelSettings(BaseModel):
 class BatchSettings(BaseModel):
     dataset_id: int
     indicator_id: int | None = None
-    mode: Literal["province", "custom", "all"] = "province"
+    mode: Literal["province", "custom", "all", "levels"] = "province"
+    enabled_levels: list[Level] = Field(default_factory=list, max_length=4)
     org_ids: list[int] = Field(default_factory=list, max_length=100000)
     excluded: list[int] = Field(default_factory=list, max_length=100000)
     levels: dict[Level, LevelSettings] = Field(default_factory=dict)
     overrides: dict[int, int] = Field(default_factory=dict)
     ai_orgs: list[int] = Field(default_factory=list, max_length=100000)
+    automatic: bool = False
+    indicator_assets: list[int] = Field(default_factory=list, max_length=30)
 
 
 class IndicatorRule(BaseModel):
@@ -65,6 +68,8 @@ def preview_reports(db, settings: BatchSettings, templates: dict[int, dict]) -> 
         selected = {1}
     elif settings.mode == "all":
         selected = set(orgs)
+    elif settings.mode == "levels":
+        selected = {org_id for org_id, org in orgs.items() if org["level"] in settings.enabled_levels}
     selected.difference_update(settings.excluded)
     if selected - orgs.keys():
         raise ValueError("所选组织已失效，请刷新导入结果")
@@ -97,7 +102,8 @@ def preview_reports(db, settings: BatchSettings, templates: dict[int, dict]) -> 
             counters[level] += 1
         sample = {qid: counts.get((org_id, qid), 0) for qid in chosen}
         available = [qid for qid in chosen if sample[qid]]
-        variants = ([[qid] for qid in available] if config.split else [chosen]) if available else []
+        split = config.split and not (settings.automatic and level == "province")
+        variants = ([[qid] for qid in available] if split else [chosen]) if available else []
         subtotal = groups[level]
         subtotal["organizations"] += 1
         subtotal["responses"] += sum(sample.values())
@@ -106,7 +112,8 @@ def preview_reports(db, settings: BatchSettings, templates: dict[int, dict]) -> 
         rows.append({**org, "template_id": assignment, "samples": sample, "reports": len(variants),
                      "skipped_questionnaires": [qid for qid in chosen if not sample[qid]]})
         jobs.extend({"org_id": org_id, "org_level": level, "org_path": org["path"], "template_id": assignment,
-                     "questionnaires": variant, "include_ai": org_id in known_ai} for variant in variants)
+                     "questionnaires": variant, "include_ai": settings.automatic or org_id in known_ai}
+                    for variant in variants)
     preview = {"levels": groups, "reports": len(jobs), "organizations": rows,
                "questionnaires": questionnaires, "ai_reports": sum(job["include_ai"] for job in jobs)}
     return preview, jobs

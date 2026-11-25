@@ -106,7 +106,7 @@
         <template v-else>
           <div class="toolbar">
             <label class="upload"><el-icon><Upload /></el-icon> 上传指标资料
-              <input type="file" accept=".xlsx,.docx,.pdf" :disabled="busy" @change="uploadFiles($event, 'indicator')" />
+              <input type="file" accept=".xlsx,.docx,.pdf" multiple :disabled="busy" @change="uploadFiles($event, 'indicator')" />
             </label>
             <el-select v-model="indicatorAsset" clearable placeholder="选择指标资料" class="wide-select"><el-option v-for="asset in indicatorAssets" :key="asset.id" :label="asset.name" :value="asset.id" /></el-select>
             <el-button :loading="busy" :disabled="!indicatorAsset" @click="suggestIndicators">AI 提取映射</el-button>
@@ -141,12 +141,16 @@
           <div class="toolbar">
             <el-radio-group :model-value="selection.mode" @change="chooseMode">
               <el-radio-button value="province">仅全省</el-radio-button>
+              <el-radio-button value="levels">按层级全选</el-radio-button>
               <el-radio-button value="custom">自选组织</el-radio-button>
               <el-radio-button value="all">全选四级</el-radio-button>
             </el-radio-group>
             <el-text>{{ selectedCount.toLocaleString() }} 个组织</el-text>
           </div>
-          <section v-if="selection.mode !== 'province'" class="section-block">
+          <el-checkbox-group v-if="selection.mode === 'levels'" v-model="selection.enabled_levels" class="toolbar" aria-label="生成层级">
+            <el-checkbox v-for="[key, label] in levels" :key="key" :value="key">{{ label }}</el-checkbox>
+          </el-checkbox-group>
+          <section v-if="selection.mode === 'custom' || selection.mode === 'all'" class="section-block">
             <div class="toolbar">
               <el-input v-model="orgSearch" :prefix-icon="Search" clearable placeholder="搜索组织名称或学校 ID" class="wide-select" />
               <el-select v-model="orgLevel" clearable placeholder="所有层级" class="medium-select"><el-option v-for="[value, label] in levels" :key="value" :value="value" :label="label" /></el-select>
@@ -177,17 +181,26 @@
               <el-select v-model="selection.levels[key].templates" multiple filterable collapse-tags placeholder="本级默认模板" @change="cleanOverrides(key)">
                 <el-option v-for="row in levelTemplates(key)" :key="row.id" :value="row.id" :label="row.name + ' #' + row.id" />
               </el-select>
-              <el-checkbox v-model="selection.levels[key].split">按问卷分开</el-checkbox>
+              <el-checkbox v-if="key !== 'province'" v-model="selection.levels[key].split">按问卷分开</el-checkbox>
+              <span v-else>合并一份</span>
             </template>
           </div>
           <div class="toolbar spaced">
-            <el-select v-model="selection.indicator_id" clearable placeholder="逐题统计（无年度指标）" class="wide-select">
+            <label class="upload"><el-icon><Upload /></el-icon> 上传年度指标
+              <input type="file" accept=".xlsx,.docx,.pdf" multiple :disabled="busy" @change="uploadFiles($event, 'indicator')" />
+            </label>
+            <el-select v-model="selection.indicator_assets" multiple filterable collapse-tags placeholder="选择年度指标资料"
+                       aria-label="年度指标资料" :disabled="!!selection.indicator_id" class="wide-select">
+              <el-option v-for="asset in indicatorAssets" :key="asset.id" :label="asset.name" :value="asset.id" />
+            </el-select>
+            <el-select v-if="indicators.length" v-model="selection.indicator_id" clearable
+                       :disabled="!!selection.indicator_assets.length" placeholder="已确认的指标版本" class="wide-select">
               <el-option v-for="row in indicators" :key="row.id" :value="row.id" :label="'指标版本 #' + row.id + ' · ' + row.rules.length + ' 个指标'" />
             </el-select>
             <el-button type="primary" :disabled="!selectedCount" :loading="busy" @click="makePreview">预览出报清单</el-button>
           </div>
           <section v-if="preview" class="section-block">
-            <div class="toolbar"><h2>预计生成 {{ preview.reports.toLocaleString() }} 份 Word</h2><el-text v-if="preview.ai_reports">AI 解读 {{ preview.ai_reports }} 份</el-text></div>
+            <div class="toolbar"><h2>预计生成 {{ preview.reports.toLocaleString() }} 份正式 Word</h2></div>
             <el-table :data="previewLevels">
               <el-table-column prop="label" label="层级" /><el-table-column prop="organizations" label="组织数" /><el-table-column prop="responses" label="答卷数" /><el-table-column prop="reports" label="Word 份数" /><el-table-column prop="skipped" label="跳过组织数" />
             </el-table>
@@ -202,12 +215,11 @@
                 </el-select>
                 <span v-else>本级默认模板</span>
               </template></el-table-column>
-              <el-table-column label="生成份数" prop="reports" width="90" />
-              <el-table-column label="AI 解读" width="90"><template #default="{ row }"><el-checkbox :model-value="selection.ai_orgs.includes(row.id)" :disabled="!row.reports" :aria-label="'为 ' + row.name + ' 添加 AI 解读'" @change="value => selectAi(row.id, value)" /></template></el-table-column>
+              <el-table-column label="生成份数" width="100"><template #default="{ row }">{{ row.reports || '无答卷' }}</template></el-table-column>
             </el-table>
             <div class="toolbar spaced between">
               <el-pagination v-model:current-page="previewPage" :page-size="30" :total="filteredPreview.length" layout="prev, pager, next, total" />
-              <el-button type="primary" :loading="busy" :disabled="!preview.reports" @click="submitBatch">确认并生成</el-button>
+              <el-button type="primary" :loading="busy" :disabled="!preview.reports" @click="submitBatch">一键生成</el-button>
             </div>
           </section>
         </template>
@@ -222,6 +234,20 @@
         </div>
         <el-empty v-if="!batch" description="暂无出报批次" />
         <template v-else>
+          <div v-if="batch.generation && batch.generation.state !== 'done'" class="toolbar" aria-live="polite">
+            <el-alert :type="batch.generation.state === 'failed' ? 'error' : 'info'" :closable="false"
+                      :title="batch.generation.error || batch.generation.stage" />
+            <el-button v-if="batch.generation.state === 'failed'" @click="retryBatch">继续处理</el-button>
+          </div>
+          <el-collapse v-if="batch.generation?.missing.length">
+            <el-collapse-item :title="'年度指标缺项 · ' + batch.generation.missing.length + ' 项'">
+              <el-table :data="batch.generation.missing">
+                <el-table-column label="指标" prop="name" />
+                <el-table-column label="资料位置" prop="source" />
+                <el-table-column label="原因" prop="reason" />
+              </el-table>
+            </el-collapse-item>
+          </el-collapse>
           <el-progress :percentage="Math.floor(100 * (batch.counts.done + batch.counts.failed) / batch.total)" />
           <div class="toolbar spaced">
             <el-text>已完成 {{ batch.counts.done }} · 运行中 {{ batch.counts.running }} · 排队 {{ batch.counts.queued }} · 失败 {{ batch.counts.failed }}</el-text>
@@ -230,7 +256,9 @@
             <el-select v-model="zipLevel" clearable placeholder="ZIP 全部层级" class="medium-select"><el-option v-for="[value, label] in levels" :key="value" :value="value" :label="label" /></el-select>
             <el-select v-model="zipOrg" clearable filterable placeholder="ZIP 全辖区" class="wide-select"><el-option v-for="org in batchJurisdictions" :key="org.id" :value="org.id" :label="org.path" /></el-select>
             <el-input-number v-model="zipPart" :min="1" :max="zipParts" aria-label="ZIP 分包序号" />
-            <el-button :icon="Download" :disabled="!batch.counts.done" :loading="downloading" @click="downloadZip">下载 ZIP 分包</el-button>
+            <el-button :icon="Download" :disabled="!batch.counts.done" :loading="downloading" @click="downloadZip(false)">下载报告 ZIP</el-button>
+            <el-button v-if="batch.generation" :icon="Download" :disabled="!batch.counts.done" :loading="downloading"
+                       @click="downloadZip(true)">下载红字 ZIP</el-button>
             <el-text>每包最多 100 份</el-text>
           </div>
           <div class="toolbar"><el-select v-model="reportState" clearable placeholder="全部状态" class="medium-select"><el-option v-for="[key, label] in Object.entries(states)" :key="key" :value="key" :label="label" /></el-select></div>
@@ -238,9 +266,21 @@
             <el-table-column prop="org_path" label="组织" min-width="260" />
             <el-table-column label="问卷" min-width="200"><template #default="{ row }">{{ row.questionnaires.join('、') }}</template></el-table-column>
             <el-table-column label="状态" width="100"><template #default="{ row }">{{ states[row.state] }}</template></el-table-column>
-            <el-table-column label="处理说明" min-width="180"><template #default="{ row }">{{ row.error || row.notice }}</template></el-table-column>
-            <el-table-column width="110"><template #default="{ row }">
+            <el-table-column label="处理说明" min-width="180"><template #default="{ row }">
+              {{ row.error || row.notice }}
+              <el-popover v-if="row.missing?.length" trigger="click" width="min(440px, 90vw)">
+                <template #reference><el-button link type="primary">查看缺项</el-button></template>
+                <ul class="missing-items">
+                  <li v-for="(item, index) in row.missing" :key="index">
+                    <strong>{{ item.name }}</strong> · {{ item.reason }}
+                    <div v-if="item.source" class="muted">{{ item.source }}</div>
+                  </li>
+                </ul>
+              </el-popover>
+            </template></el-table-column>
+            <el-table-column width="165"><template #default="{ row }">
               <el-button v-if="row.state === 'done'" link type="primary" :icon="Download" @click="downloadWord(row)">Word</el-button>
+              <el-button v-if="row.analysis" link type="primary" @click="downloadAnalysis(row)">红字解析</el-button>
               <el-button v-if="row.state === 'failed'" link type="primary" @click="retry(row)">重试</el-button>
             </template></el-table-column>
           </el-table>
@@ -347,7 +387,8 @@ const zipParts = computed(() => {
 
 function emptySelection() {
   return {
-    mode: 'province', org_ids: [], excluded: [], overrides: {}, ai_orgs: [], indicator_id: null,
+    mode: 'province', enabled_levels: ['city'], org_ids: [], excluded: [], overrides: {},
+    indicator_id: null, indicator_assets: [],
     levels: Object.fromEntries(levels.map(([key]) => [key, { questionnaires: [], templates: [], split: false }])),
   }
 }
@@ -402,7 +443,11 @@ async function uploadFiles(event, kind) {
         prepareSource(data, true)
         chooseSource(data.id, true)
       }
-      if (kind === 'indicator') indicatorAsset.value = data.id
+      if (kind === 'indicator') {
+        indicatorAsset.value = data.id
+        selection.indicator_id = null
+        selection.indicator_assets = toggleOrganizations(selection.indicator_assets, [data], true)
+      }
       if (kind === 'template' && files.length === 1) editTemplate(data)
     }
     await loadProject()
@@ -492,6 +537,7 @@ function chooseMode(mode) {
 
 function isSelected(orgId) {
   if (selection.mode === 'province') return orgId === 1
+  if (selection.mode === 'levels') return selection.enabled_levels.includes(orgById.value.get(orgId)?.level)
   return selection.mode === 'all' ? !excluded.value.has(orgId) : included.value.has(orgId)
 }
 
@@ -513,11 +559,11 @@ function cleanOverrides(level) {
 }
 
 function payload() {
-  return { ...clone(selection), dataset_id: project.value?.dataset_id, indicator_id: selection.indicator_id || null }
+  return { ...clone(selection), dataset_id: project.value?.dataset_id, automatic: true, indicator_id: selection.indicator_id || null }
 }
 
 const baseKey = computed(() => {
-  const { ai_orgs, overrides, ...base } = payload()
+  const { overrides, ...base } = payload()
   return JSON.stringify(base)
 })
 watch(baseKey, () => { preview.value = null })
@@ -542,16 +588,10 @@ function changeTemplateAssignment(orgId, value) {
   selection.overrides[orgId] = value
 }
 
-function selectAi(orgId, value) {
-  selection.ai_orgs = toggleOrganizations(selection.ai_orgs, [{ id: orgId }], value)
-  preview.value.ai_reports = preview.value.organizations.reduce((total, row) => total +
-    (selection.ai_orgs.includes(row.id) ? row.reports : 0), 0)
-}
-
 async function submitBatch() {
   if (previewedKey.value !== baseKey.value) return
   await withBusy(async () => {
-    const { data } = await api.post(endpoint.value + '/batches', { ...payload(), request_id: requestId.value })
+    const { data } = await api.post(endpoint.value + '/generate', { ...payload(), request_id: requestId.value })
     batchId.value = data.id
     tab.value = 'batches'
     preview.value = null
@@ -570,6 +610,7 @@ async function loadProject() {
   for (const asset of sources.value) prepareSource(asset, false)
   if (data.dataset_id && data.dataset_id !== previous) {
     Object.assign(selection, emptySelection())
+    selection.indicator_assets = indicatorAssets.value.map(asset => asset.id)
     catalog.value = null
     questions.value = []
     indicatorDraft.value = []
@@ -624,6 +665,13 @@ async function retry(row) {
   })
 }
 
+async function retryBatch() {
+  await withBusy(async () => {
+    await api.post(endpoint.value + '/batches/' + batchId.value + '/retry')
+    await loadBatch()
+  })
+}
+
 async function getDownload(path, params, fallback) {
   if (downloading.value) return
   downloading.value = true
@@ -649,8 +697,13 @@ function downloadWord(row) {
   return getDownload('/reports/' + row.id + '/download', {}, '问卷报告.docx')
 }
 
-function downloadZip() {
-  return getDownload('/zip', { level: zipLevel.value || undefined, org_id: zipOrg.value || undefined, part: zipPart.value }, '问卷报告.zip')
+function downloadAnalysis(row) {
+  return getDownload('/reports/' + row.id + '/analysis', {}, '红字解析.docx')
+}
+
+function downloadZip(analysis) {
+  return getDownload('/zip', { level: zipLevel.value || undefined, org_id: zipOrg.value || undefined,
+    part: zipPart.value, analysis }, analysis ? '红字解析.zip' : '问卷报告.zip')
 }
 
 watch(id, async active => {
@@ -673,7 +726,15 @@ watch(id, async active => {
   tab.value = 'data'
   for (const key of Object.keys(mappings)) delete mappings[key]
   try {
-    if (active) { await loadProject(); await refreshBatches() }
+    if (active) {
+      await loadProject()
+      await refreshBatches()
+      const unfinished = batches.value.find(row => row.generation?.state !== 'failed' && (row.counts.queued || row.counts.running))
+      if (unfinished) {
+        batchId.value = unfinished.id
+        tab.value = 'batches'
+      } else if (catalog.value) tab.value = 'plan'
+    }
     else projects.value = (await api.get('/surveys')).data
   } catch { /* error handled by API interceptor */ }
 }, { immediate: true })
@@ -692,7 +753,8 @@ const timer = setInterval(async () => {
   polling = true
   try {
     if (importing.value) await loadProject()
-    if (tab.value === 'batches' && batch.value && (batch.value.counts.queued || batch.value.counts.running)) await refreshBatches()
+    if (tab.value === 'batches' && batch.value?.generation?.state !== 'failed'
+        && (batch.value?.counts.queued || batch.value?.counts.running)) await refreshBatches()
   } catch { /* error handled by API interceptor */ }
   finally { polling = false }
 }, 2500)
@@ -725,6 +787,8 @@ h3 { font-size: 14px; margin: 7px 0; overflow-wrap: anywhere; }
 .indicator-edit { display: grid; grid-template-columns: minmax(105px, 1fr) minmax(155px, 2fr) repeat(4, minmax(105px, 1fr)) auto; gap: 8px; margin-bottom: 10px; }
 .template-preview { max-height: 310px; overflow: auto; padding-inline-start: 27px; }
 .template-preview li { padding: 6px 8px; overflow-wrap: anywhere; }
+.missing-items { padding-inline-start: 20px; margin: 0; max-height: 280px; overflow: auto; overflow-wrap: anywhere; }
+.missing-items li { padding-block: 5px; }
 .anchor { background: var(--el-color-primary-light-9); color: var(--el-color-primary-dark-2); }
 .question-rule span { min-width: min(100%, 240px); max-width: 100%; overflow-wrap: anywhere; }
 .el-pagination { margin-top: 10px; max-width: 100%; overflow: auto; }
