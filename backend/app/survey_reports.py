@@ -2,12 +2,15 @@
 
 import io
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Literal
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
@@ -203,9 +206,36 @@ def safe_filename(text: str) -> str:
     return text[:85].strip(". ") or "问卷报告"
 
 
+def default_styles(doc):
+    if sys.platform == "darwin":
+        east_asia = "Songti SC"
+    elif sys.platform == "win32":
+        east_asia = "SimSun"
+    else:
+        east_asia = "Noto Sans CJK SC"
+    for name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3"):
+        style = doc.styles[name]
+        style.font.color.rgb = RGBColor.from_string("18232C")
+        style.font.size = Pt({"Normal": 11, "Title": 24, "Heading 1": 16, "Heading 2": 13, "Heading 3": 11}[name])
+        properties = style.element.get_or_add_rPr()
+        fonts = properties.get_or_add_rFonts()
+        fonts.attrib.pop(qn("w:eastAsiaTheme"), None)
+        fonts.set(qn("w:eastAsia"), east_asia)
+        language = properties.find(qn("w:lang"))
+        if language is None:
+            language = OxmlElement("w:lang")
+            properties.append(language)
+        language.set(qn("w:eastAsia"), "zh-CN")
+    title = doc.styles["Title"].element.get_or_add_pPr()
+    border = title.find(qn("w:pBdr"))
+    if border is not None:
+        title.remove(border)
+
+
 def new_document(level, title, template):
     if template is None:
         doc = Document()
+        default_styles(doc)
         section = doc.sections[0]
         section.top_margin = section.bottom_margin = Cm(2.25)
         section.left_margin = section.right_margin = Cm(2.5)

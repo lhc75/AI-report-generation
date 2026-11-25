@@ -6,6 +6,7 @@ from zipfile import ZipFile
 
 import pytest
 from docx import Document
+from docx.oxml.ns import qn
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from sqlalchemy import select, update
@@ -136,6 +137,8 @@ def test_scope_indicators_templates_versions_and_downloads(client):
     response = http.get(f"{batch_url}/reports/{report_id}/download")
     assert response.is_success
     document = Document(io.BytesIO(response.content))
+    for style_name in ("Title", "Normal", "Heading 1", "Heading 2", "Heading 3"):
+        assert document.styles[style_name].element.rPr.rFonts.get(qn("w:eastAsia"))
     texts = "\n".join(p.text for p in document.paragraphs)
     for expected in ("满意比例  50.0%", "图书勾选率  100.0%", "数值均值  30.00", "教师", "学生"):
         assert expected in texts
