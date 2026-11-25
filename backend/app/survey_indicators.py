@@ -178,9 +178,12 @@ name、location、definition、reason，questionnaire_id 已知才填，rule 为
 rule 字段：name、questionnaire_id、method（count 人数、rate 比例、mean 均值、score 综合分）、
 question_id（仅需要时指定）、population（分母人群必须同时满足的筛选条件，空数组代表全部）、
 matches（比例或计数的分子条件）、denominator（eligible 为符合筛选的人，answered 为其中分子用题均有效作答的人）、
-terms（综合分项，每项 question_id、weight、scores，数值题 scores 为空，单选题须列全选项分值）、
+terms（综合分项的对象数组，数值题的 scores 为 {}，单选题的 scores 为选项原文到数值的对象）、
 scale、offset、unit（人数或比例请留空，其他如分或学时）。综合分为每人各题加权和乘 scale 加 offset 后取平均；
 没有定义的留空或标记缺项。
+综合分结构示例（ID、选项和分值仅示意）："terms":[{"question_id":1001,"weight":1,"scores":{}},
+{"question_id":1002,"weight":2,"scores":{"选项甲":5,"选项乙":1}}]。terms 和 scores 均不接受公式字符串、
+数组形式的分值表或只有题目 ID 的数组。分值来自原文时才能输出。
 条件字段 question_id、op、value。op=selected/not_selected 取选项原文，eq/ge/gt/le/lt 比较数值，
 answered 表示有效作答并省略 value。不要跨问卷关联受访者。"""
 
@@ -223,8 +226,9 @@ async def parse_indicators(config, materials, questions, questionnaire_ids):
                         rule = AnnualRule.model_validate({**item["rule"], "name": label})
                         validate_rule(rule, questions, questionnaire_ids)
                     except ValueError as exc:
-                        detail = ("；".join(row["msg"].removeprefix("Value error, ") for row in exc.errors())
-                                  if isinstance(exc, ValidationError) else str(exc))[:250]
+                        detail = ("；".join(
+                            f"{'.'.join(map(str, row['loc'])) or '指标规则'} {row['msg'].removeprefix('Value error, ')}"
+                            for row in exc.errors()) if isinstance(exc, ValidationError) else str(exc))[:250]
                         errors.append(f"{label} {detail}")
                         gaps.append({**info, "reason": detail})
                         continue

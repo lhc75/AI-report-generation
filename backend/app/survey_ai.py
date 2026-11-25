@@ -21,9 +21,14 @@ async def validated_json(config, instructions, payload, validate, *, timeout=60,
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
     feedback = ""
+    previous = ""
     with allow_model_failover():
         for attempt in range(attempts):
-            messages = base if not feedback else base + [{"role": "user", "content": feedback}]
+            messages = list(base)
+            if previous:
+                messages.append({"role": "assistant", "content": previous})
+            if feedback:
+                messages.append({"role": "user", "content": feedback})
             try:
                 async with slots:
                     raw = await chat_completion(config, messages, timeout=timeout, retries=0)
@@ -35,5 +40,6 @@ async def validated_json(config, instructions, payload, validate, *, timeout=60,
                 normalized = re.sub(r"\A```(?:json)?\s*|\s*```\Z", "", raw.strip(), flags=re.IGNORECASE)
                 return validate(json.loads(normalized))
             except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                previous = raw[:9000] if isinstance(raw, str) else ""
                 feedback = f"校验发现问题：{str(exc)[:1200]}。请修正并返回完整 JSON。"
     raise ValueError(feedback or "AI 输出未通过校验")
