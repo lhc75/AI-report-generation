@@ -6,7 +6,7 @@
         <h3 class="page-title">{{ project?.name }}</h3>
         <el-tag v-if="project" :type="statusType(project.status)">{{ statusText(project.status) }}</el-tag>
       </div>
-      <div>
+      <div class="toolbar-actions">
         <el-button
           v-if="project?.parsed_template_path"
           :icon="Download"
@@ -23,6 +23,7 @@
           :icon="Download"
           @click="downloadReport"
         >下载报告</el-button>
+        <template v-if="showSteps">
         <el-button
           v-if="(project?.status === 'analyzed' || project?.status === 'assembling') && chapters.length"
           type="warning"
@@ -40,16 +41,24 @@
           @click="generateAll"
         >全部生成</el-button>
         <el-button
-          type="primary"
           :icon="MagicStick"
           :loading="project?.status === 'analyzing'"
           :disabled="!hasTemplate || mutationBlocked"
           @click="analyze"
         >{{ project?.status === 'analyzing' ? '分析中…' : '分析' }}</el-button>
+        </template>
+        <el-button text :aria-expanded="showSteps" @click="showSteps = !showSteps">分步操作</el-button>
+        <el-button
+          type="primary"
+          :icon="MagicStick"
+          :loading="project?.auto_report || (acting && activeOperation?.kind === 'automatic')"
+          :disabled="!hasTemplate || mutationBlocked"
+          @click="automaticReport"
+        >一键生成报告</el-button>
       </div>
     </div>
 
-    <div v-if="['generating', 'assembling'].includes(project?.status) && project?.progress?.label" class="progress-row">
+    <div v-if="['analyzing', 'generating', 'assembling'].includes(project?.status) && project?.progress?.label" class="progress-row">
       <el-progress
         :percentage="project.progress.percent || 0"
         :stroke-width="12"
@@ -76,9 +85,7 @@
       <el-button v-if="pollStopped" size="small" @click="retryPolling">重新连接</el-button>
     </el-alert>
     <el-alert v-if="chapters.some((c) => c.is_stale)" type="warning" :closable="false"
-      :title="project?.status === 'created'
-        ? '资料或统计设置已变更，旧内容已保留；请重新分析并生成后导出。'
-        : '生成指令或内容已更新，旧内容已保留；请重新生成待更新模块后导出。'" class="page-alert" />
+      title="项目有更新，报告待重新生成" class="page-alert" />
 
     <el-row :gutter="16" class="upload-row">
       <el-col :span="8" v-for="slot in slots" :key="slot.type">
@@ -113,7 +120,6 @@
     <div class="chapter-section">
       <div class="section-head">
         <h4 class="section-title">章节写作任务</h4>
-        <span class="section-tip">解析模版后，每个章节需要编写的内容会保存在这里；点击"生成"逐模块填写内容</span>
       </div>
       <el-table :data="chapterTree" row-key="id" border default-expand-all
         :tree-props="{ children: 'children' }" v-loading="chaptersLoading">
@@ -172,7 +178,7 @@
             </template>
           </template>
         </el-table-column>
-        <template #empty>点击右上角"分析"解析模版</template>
+        <template #empty>上传模板后即可生成报告</template>
       </el-table>
     </div>
 
@@ -340,6 +346,7 @@ const previewError = ref('')
 const previewBodyRef = ref(null)
 const chaptersLoading = ref(false)
 const acting = ref(false)
+const showSteps = ref(false)
 const pendingUploads = ref(0)
 const pollError = ref('')
 const pollStopped = ref(false)
@@ -386,7 +393,7 @@ const statisticsError = ref('')
 let statisticsSequence = 0
 
 const slots = [
-  { type: 'template', title: '模版', tip: 'DOCX（点击“分析”后由 AI 自动生成红色指令，也可自行标红）', accept: '.docx' },
+  { type: 'template', title: '模版', tip: 'DOCX', accept: '.docx' },
   { type: 'reference', title: '参考资料', tip: 'DOCX / PDF，可上传多份', accept: '.docx,.pdf' },
   { type: 'data', title: '数据', tip: 'Excel / CSV，可上传多份', accept: '.xlsx,.xls,.csv' },
 ]
@@ -545,7 +552,7 @@ async function loadPage() {
   try {
     await refreshSnapshot()
     if (projectBusy.value && !activeOperation.value) {
-      const kind = project.value.status === 'analyzing' ? 'analyze'
+      const kind = project.value.auto_report ? 'automatic' : project.value.status === 'analyzing' ? 'analyze'
         : project.value.status === 'assembling' ? 'assemble' : 'generate'
       activeOperation.value = { kind, runId: project.value.operation_token }
       startPolling()
@@ -637,6 +644,11 @@ async function removeFile(file) {
 async function analyze() {
   await mutate(() => api.post(`/projects/${pid}/analyze`), {
     kind: 'analyze', message: '已开始分析模版',
+  })
+}
+async function automaticReport() {
+  await mutate(() => api.post('/projects/' + pid + '/automatic-report'), {
+    kind: 'automatic', message: '报告已开始自动生成',
   })
 }
 async function generateAll() {
@@ -856,6 +868,8 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.toolbar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; justify-content: flex-end; }
+.toolbar-actions :deep(.el-button + .el-button) { margin-left: 0; }
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .left { display: flex; align-items: center; gap: 12px; }
 .page-title { margin: 0; font-size: 17px; }
@@ -878,7 +892,6 @@ onBeforeUnmount(() => {
 .chapter-section { background: #fff; border: 1px solid #e4e7ed; border-radius: 8px; padding: 14px 16px; }
 .section-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
 .section-title { margin: 0; font-size: 15px; }
-.section-tip { font-size: 12px; color: #909399; }
 .page-alert { margin-bottom: 16px; }
 .task-copy { display: inline-block; max-width: 100%; vertical-align: middle; }
 .task-primary, .task-instruction { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

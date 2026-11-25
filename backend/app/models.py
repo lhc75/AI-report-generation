@@ -87,6 +87,7 @@ class Project(Base):
     evidence_path: Mapped[str] = mapped_column(String(512), default="")
     report_path: Mapped[str] = mapped_column(String(512), default="")  # 导出的 Word 报告
     operation_token: Mapped[str] = mapped_column(String(36), default="")
+    auto_report: Mapped[bool] = mapped_column(Boolean, default=False)
     material_revision: Mapped[int] = mapped_column(Integer, default=0)
     last_run_id: Mapped[str] = mapped_column(String(36), default="")
     last_run_result: Mapped[str] = mapped_column(Text, default="{}")

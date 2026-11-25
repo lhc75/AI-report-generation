@@ -238,7 +238,7 @@
             <el-table-column prop="org_path" label="组织" min-width="260" />
             <el-table-column label="问卷" min-width="200"><template #default="{ row }">{{ row.questionnaires.join('、') }}</template></el-table-column>
             <el-table-column label="状态" width="100"><template #default="{ row }">{{ states[row.state] }}</template></el-table-column>
-            <el-table-column prop="error" label="失败原因" min-width="180" />
+            <el-table-column label="处理说明" min-width="180"><template #default="{ row }">{{ row.error || row.notice }}</template></el-table-column>
             <el-table-column width="110"><template #default="{ row }">
               <el-button v-if="row.state === 'done'" link type="primary" :icon="Download" @click="downloadWord(row)">Word</el-button>
               <el-button v-if="row.state === 'failed'" link type="primary" @click="retry(row)">重试</el-button>
@@ -565,6 +565,7 @@ async function loadProject() {
   const { data } = await api.get('/surveys/' + current)
   if (id.value !== current) return
   const previous = project.value?.dataset_id
+  const wasImporting = importing.value
   project.value = data
   for (const asset of sources.value) prepareSource(asset, false)
   if (data.dataset_id && data.dataset_id !== previous) {
@@ -578,6 +579,7 @@ async function loadProject() {
     if (id.value === current && project.value?.dataset_id === data.dataset_id) {
       catalog.value = responses[0].data
       questions.value = responses[1].data
+      if (wasImporting && tab.value === 'data') tab.value = 'plan'
     }
   }
 }

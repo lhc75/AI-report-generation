@@ -66,6 +66,7 @@ def finish_run(project_id: int, token: str, status: str, result: dict) -> None:
         if project.operation_token != token:
             return
         project.operation_token = ""
+        project.auto_report = False
         project.progress_json = "{}"
         project.status = status
         project.last_run_id = token
@@ -83,20 +84,23 @@ _PROGRESS_PHASES = {
     "qa": (95, 100),
 }
 
+_AUTO_PHASES = {
+    "analysis": (0, 15), "generate": (15, 55), "review": (70, 10),
+    "repair": (80, 5), "final": (85, 5), "render": (90, 7), "qa": (97, 3),
+}
+
 
 def report_progress(project_id: int, token: str | None, *, phase: str, label: str,
                     done: int = 0, total: int = 0) -> None:
     """运行进度上报（仅展示）：令牌校验 + 静默失败，不影响导出主流程。"""
     if token is None:
         return
-    base, span = _PROGRESS_PHASES.get(phase, (0, 100))
     ratio = min(1.0, max(0.0, done / total)) if total else 0.0
     payload = {
         "phase": phase,
         "label": label,
         "done": int(done),
         "total": int(total),
-        "percent": int(base + span * ratio),
         "updated_at": int(time.time()),
     }
     try:
@@ -104,6 +108,12 @@ def report_progress(project_id: int, token: str | None, *, phase: str, label: st
             project = db.get(Project, project_id)
             if project is None or project.operation_token != token:
                 return
+            phases = _AUTO_PHASES if project.auto_report else _PROGRESS_PHASES
+            base, span = phases.get(phase, (0, 100))
+            percent = int(base + span * ratio)
+            if project.auto_report:
+                percent = max(percent, json.loads(project.progress_json or "{}").get("percent", 0))
+            payload["percent"] = percent
             project.progress_json = json.dumps(payload, ensure_ascii=False)
             db.commit()
     except Exception:

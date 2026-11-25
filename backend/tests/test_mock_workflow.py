@@ -6,6 +6,7 @@ import os
 import shutil
 from pathlib import Path
 
+import pytest
 from docx import Document
 from docx.shared import RGBColor
 from fastapi import BackgroundTasks, UploadFile
@@ -16,7 +17,8 @@ from app.models import ChapterTask, ModelConfig, ModuleContent, Project
 from app.routers import projects
 
 
-def test_mock_model_workflow_with_native_docx_render(project, db, monkeypatch, tmp_path):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_mock_model_workflow_with_native_docx_render(project, db, monkeypatch, tmp_path, automatic):
     run_dirs = []
     fresh_workdir = sandbox.fresh_workdir
     def record_workdir(project_id, task_id, run_token=None):
@@ -47,13 +49,14 @@ def test_mock_model_workflow_with_native_docx_render(project, db, monkeypatch, t
     for filename, raw, kind in [("template.docx", doc_stream.getvalue(), "template"),
                                 ("调查数据.csv", "态度\n支持\n支持\n反对\n".encode(), "data")]:
         asyncio.run(projects.upload_file(project_id, UploadFile(filename=filename, file=io.BytesIO(raw)), kind, user, db))
-    background = BackgroundTasks()
-    analysis = asyncio.run(projects.analyze(project_id, background, user, db))
-    assert analysis["run_id"]
-    asyncio.run(background())
-    db.expire_all()
-    item = db.get(Project, project_id)
-    assert item.status == "analyzed"
+    if not automatic:
+        background = BackgroundTasks()
+        analysis = asyncio.run(projects.analyze(project_id, background, user, db))
+        assert analysis["run_id"]
+        asyncio.run(background())
+        db.expire_all()
+        item = db.get(Project, project_id)
+        assert item.status == "analyzed"
 
     text = ("支持者有2人，占66.7%。调查结果显示，多数受访者持支持态度。"
             "后续工作可结合不同意见进一步了解受访者的具体需求，并据此安排沟通与反馈。")
@@ -107,6 +110,50 @@ def test_mock_model_workflow_with_native_docx_render(project, db, monkeypatch, t
         return json.dumps(payload, ensure_ascii=False)
 
     monkeypatch.setattr(generate, "chat_completion", fake_model)
+    if automatic:
+        real_assemble = assemble.assemble_report
+        attempts = []
+
+        async def interrupted_once(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise TimeoutError("临时导出失败")
+            return await real_assemble(*args, **kwargs)
+
+        monkeypatch.setattr(assemble, "assemble_report", interrupted_once)
+
+        async def one_click():
+            background = BackgroundTasks()
+            result = await projects.start_automatic_report(project_id, background, user)
+            await background()
+            return result
+
+        result = asyncio.run(one_click())
+        db.expire_all()
+        saved = db.get(Project, project_id)
+        assert not saved.auto_report and not saved.operation_token
+        assert saved.last_run_id == result["run_id"]
+        assert saved.report_path, saved.error_msg
+        assert len(attempts) == 2
+        assert review_calls.count("light") == 3 and "final" in review_calls
+        report = Document(io.BytesIO(storage.download_bytes(saved.report_path)))
+        assert len(report.tables) == len(report.inline_shapes) == 1
+        assert text in "\n".join(p.text for p in report.paragraphs)
+        calls_before_restart = len(calls)
+        from app.main import _recover_stale_status
+        from app import operations
+        with operations.project_transaction(project_id) as (tx, project):
+            restart_token = operations.begin_run(tx, project, "assembling")
+            project.auto_report = True
+        _recover_stale_status()
+        assert (project_id, user.id, restart_token) in projects.interrupted_automatic_reports()
+        asyncio.run(projects.run_automatic_report(project_id, user.id, restart_token))
+        assert len(calls) == calls_before_restart
+        db.expire_all()
+        assert db.get(Project, project_id).last_run_id == restart_token
+        assert db.get(Project, project_id).report_path
+        return
+
     async def workflow():
         background = BackgroundTasks()
         response = await projects.generate_all(project_id, background, user, db)

@@ -71,6 +71,22 @@ def test_valid_first_reply_needs_no_repair(monkeypatch, debug_dir):
     assert not list(debug_dir.glob("*_repair*.txt"))
 
 
+def test_automatic_analysis_reasks_when_json_has_no_writable_sections(monkeypatch, debug_dir):
+    fake, calls = _fake_chat(["[]", GOOD_TASKS])
+    monkeypatch.setattr(projects, "chat_completion", fake)
+
+    def validate(result):
+        if not result:
+            raise projects.InvalidAnalysisPlan("缺少章节指令")
+
+    result = asyncio.run(projects._complete_analysis_json(
+        SimpleNamespace(), [{"role": "user", "content": "模板写作指令"}],
+        label="模板分析", project_id=7, validate=validate,
+    ))
+    assert result == json.loads(GOOD_TASKS)
+    assert "缺少章节指令" in calls[1][-1]["content"]
+    assert "只修语法" not in calls[1][-1]["content"]
+
 def test_repair_feeds_raw_output_and_error_back(monkeypatch, debug_dir):
     result, calls = _complete(monkeypatch, [BROKEN_TASKS, GOOD_TASKS])
     assert result == json.loads(GOOD_TASKS)

@@ -3,8 +3,11 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import httpx
+from sqlalchemy import select
 
 from .config import settings
 from .models import ModelConfig
@@ -68,6 +71,37 @@ class ChatProviderError(ValueError):
 
 class ChatContextOverflow(ChatProviderError):
     """输入超出模型上下文窗口（不可重试；上层压缩历史后重试该轮请求）。"""
+
+
+_fallback_models = ContextVar("report_fallback_models", default=None)
+
+
+@contextmanager
+def allow_model_failover():
+    token = _fallback_models.set({})
+    try:
+        yield
+    finally:
+        _fallback_models.reset(token)
+
+
+def recoverable_model_failure(error):
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in _RETRIABLE_STATUS | {401, 403, 404}
+    if isinstance(error, ChatProviderError):
+        return error.retriable
+    return isinstance(error, httpx.RequestError) and not isinstance(error, _NON_RETRIABLE_REQUEST_ERRORS)
+
+
+def _backup_models(cfg):
+    from .db import SessionLocal
+
+    with SessionLocal() as db:
+        return db.scalars(select(ModelConfig).where(
+            ModelConfig.user_id == cfg.user_id, ModelConfig.id != cfg.id,
+            ModelConfig.agent_type.in_((cfg.agent_type, "")),
+        ).order_by(ModelConfig.is_default.desc(), (ModelConfig.agent_type == cfg.agent_type).desc(),
+                   ModelConfig.id).limit(2)).all()
 
 
 def enabled_params(cfg: ModelConfig) -> dict:
@@ -344,6 +378,38 @@ async def _chat_completion_plain(
 
 
 async def chat_completion(
+    cfg: ModelConfig,
+    messages: list[dict],
+    timeout: float = 600.0,
+    retries: int | None = None,
+) -> str:
+    """Use the configured model, then eligible backups during automatic report runs."""
+    fallbacks = _fallback_models.get()
+    model_id = getattr(cfg, "id", None)
+    active = fallbacks.get(model_id, cfg) if fallbacks is not None else cfg
+    try:
+        return await _complete_with_model(active, messages, timeout, retries)
+    except (httpx.HTTPError, ChatProviderError) as exc:
+        if fallbacks is None or model_id is None or not recoverable_model_failure(exc):
+            raise
+        failure = exc
+    for backup in _backup_models(cfg):
+        if backup.id == active.id:
+            continue
+        try:
+            result = await _complete_with_model(backup, messages, timeout, retries=0)
+        except (httpx.HTTPError, ChatProviderError) as exc:
+            if not recoverable_model_failure(exc):
+                raise
+            failure = exc
+        else:
+            fallbacks[model_id] = backup
+            logger.info("Report model failover %s -> %s", model_id, backup.id)
+            return result
+    raise failure
+
+
+async def _complete_with_model(
     cfg: ModelConfig,
     messages: list[dict],
     timeout: float = 600.0,

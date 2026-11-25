@@ -237,6 +237,7 @@ test('every mutation is guarded while operation token or any chapter is busy; hi
 
 test('busy controls including already open dialogs are disabled while the history button stays enabled', async () => {
   const setup = harness()
+  setup.model.showSteps.value = true
   setup.model.project.value.operation_token = 'another-run'
   const row = { id: 1, task_type: 'text', status: 'done', has_content: true, history_count: 1 }
   setup.model.chapters.value = [row]
@@ -253,10 +254,22 @@ test('busy controls including already open dialogs are disabled while the histor
     disabled: match[1].includes('disabled'),
     label: match[2].replace(/<[^>]+>/g, '').trim(),
   }))
-  for (const label of ['导出报告', '全部生成', '分析', '上传模版', '上传参考资料', '上传数据', '编辑', '重写', '插入', '删除', '保存修改', '开始重写', '插入并生成', '回退到此版本', '保存设置']) {
+  for (const label of ['一键生成报告', '导出报告', '全部生成', '分析', '上传模版', '上传参考资料', '上传数据', '编辑', '重写', '插入', '删除', '保存修改', '开始重写', '插入并生成', '回退到此版本', '保存设置']) {
     assert.equal(buttons.find((button) => button.label === label)?.disabled, true, `${label} is disabled`)
   }
   assert.equal(buttons.find((button) => button.label === '内容与历史')?.disabled, false)
+  setup.unmount()
+})
+
+test('the primary action starts the entire report in one request', async () => {
+  const setup = harness()
+  setup.model.files.value = [{ file_type: 'template' }]
+  const html = await htmlFor(setup.model)
+  assert.match(html, /一键生成报告/)
+  assert.doesNotMatch(html, /全部生成/)
+  await setup.model.automaticReport()
+  assert.deepEqual(setup.calls.filter(call => call.method === 'post').map(call => call.url),
+    ['/projects/1/automatic-report'])
   setup.unmount()
 })
 
@@ -399,11 +412,11 @@ test('instruction-only edits become visible with their distinct title after the 
   assert.equal(display.tooltip, `调查时间\n${updated.instruction}`)
   const html = await htmlFor(setup.model)
   assert.match(html, /class="task-instruction"[^>]*>依据更新后的提交时间说明完整调查周期/)
-  assert.match(html, /生成指令或内容已更新，旧内容已保留；请重新生成待更新模块后导出。/)
+  assert.match(html, /项目有更新，报告待重新生成/)
   assert.doesNotMatch(html, /请重新分析/)
   setup.model.project.value.status = 'created'
   const materialsHtml = await htmlFor(setup.model)
-  assert.match(materialsHtml, /资料或统计设置已变更，旧内容已保留；请重新分析并生成后导出。/)
+  assert.match(materialsHtml, /项目有更新，报告待重新生成/)
   assert.doesNotMatch(materialsHtml, /生成指令或内容已更新/)
   setup.unmount()
 })

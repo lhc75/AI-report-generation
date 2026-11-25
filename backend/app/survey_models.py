@@ -78,3 +78,4 @@ class SurveyReport(Base):
     include_ai: Mapped[bool] = mapped_column(default=False)
     state: Mapped[str] = mapped_column(String(16), index=True, default="queued")
     error: Mapped[str] = mapped_column(Text, default="")
+    notice: Mapped[str] = mapped_column(String(255), default="")

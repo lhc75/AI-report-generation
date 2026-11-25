@@ -76,6 +76,8 @@ _COLUMN_MIGRATIONS = [
 
 for _table, _column, _type, _default in [
     ("project", "operation_token", "VARCHAR(36)", "''"),
+    ("project", "auto_report", "INTEGER", "0"),
+    ("survey_report", "notice", "VARCHAR(255)", "''"),
     ("project", "material_revision", "INTEGER", "0"),
     ("project", "last_run_id", "VARCHAR(36)", "''"),
     ("project", "last_run_result", "TEXT", "'{}'"),

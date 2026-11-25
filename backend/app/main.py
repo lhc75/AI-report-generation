@@ -50,16 +50,17 @@ def startup() -> None:
 async def start_survey_worker() -> None:
     await asyncio.to_thread(survey_worker.recover_interrupted)
     app.state.survey_worker = asyncio.create_task(survey_worker.worker())
+    interrupted = await asyncio.to_thread(projects.interrupted_automatic_reports)
+    app.state.resumed_reports = [asyncio.create_task(projects.run_automatic_report(*row)) for row in interrupted]
 
 
 @app.on_event("shutdown")
 async def stop_survey_worker() -> None:
     task = getattr(app.state, "survey_worker", None)
-    if task:
-        task.cancel()
-        from contextlib import suppress
-        with suppress(asyncio.CancelledError):
-            await task
+    tasks = [*getattr(app.state, "resumed_reports", []), *([task] if task else [])]
+    for running in tasks:
+        running.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _recover_stale_status() -> None:
@@ -71,7 +72,7 @@ def _recover_stale_status() -> None:
 
     db = SessionLocal()
     try:
-        interrupted = db.scalars(select(Project).where(Project.operation_token != "")).all()
+        interrupted = db.scalars(select(Project).where(Project.operation_token != "", Project.auto_report.is_(False))).all()
         for project in interrupted:
             tasks = db.scalars(select(ChapterTask).where(ChapterTask.project_id == project.id,
                 ChapterTask.status.in_(["generating", "queued"]))).all()
@@ -88,20 +89,20 @@ def _recover_stale_status() -> None:
         db.query(ChapterTask).filter(ChapterTask.status.in_(["generating", "queued"])).update(
             {"status": "failed"}, synchronize_session=False
         )
-        db.query(Project).filter(Project.status == "analyzing").update(
+        db.query(Project).filter(Project.status == "analyzing", Project.auto_report.is_(False)).update(
             {"status": "failed", "error_msg": "服务重启导致分析中断，请重新点击分析",
              "progress_json": "{}"},
             synchronize_session=False,
         )
-        db.query(Project).filter(Project.status == "generating").update(
+        db.query(Project).filter(Project.status == "generating", Project.auto_report.is_(False)).update(
             {"status": "analyzed", "progress_json": "{}"}, synchronize_session=False
         )
-        db.query(Project).filter(Project.status == "assembling").update(
+        db.query(Project).filter(Project.status == "assembling", Project.auto_report.is_(False)).update(
             {"status": "analyzed", "error_msg": "服务重启导致组装中断，请重新导出",
              "progress_json": "{}"},
             synchronize_session=False,
         )
-        db.query(Project).filter(Project.operation_token != "").update(
+        db.query(Project).filter(Project.operation_token != "", Project.auto_report.is_(False)).update(
             {"operation_token": ""}, synchronize_session=False)
         db.flush()
         db.commit()

@@ -8,7 +8,7 @@ export function summarizeOperation(project, chapters, operation = {}) {
   if (project.error_msg || project.status === 'failed') {
     return { type: 'error', message: project.error_msg || '处理失败，请查看失败原因' }
   }
-  if (operation.kind === 'assemble') {
+  if (operation.kind === 'assemble' || operation.kind === 'automatic') {
     return project.report_path
       ? { type: 'success', message: '报告导出完成，可下载报告' }
       : { type: 'error', message: '导出结束但未生成报告，请重新导出' }

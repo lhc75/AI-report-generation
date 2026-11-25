@@ -10,6 +10,36 @@ import pytest
 
 from app import llm
 from app.config import Settings
+from app.models import ModelConfig
+
+
+def test_automatic_failover_uses_only_same_account_and_reuses_working_model(project, db, monkeypatch):
+    _, _, user = project
+    primary = ModelConfig(user_id=user.id, agent_type="chart", name="primary", model="primary",
+                          base_url="https://primary.invalid", api_key_enc="", is_default=True)
+    backup = ModelConfig(user_id=user.id, agent_type="", name="backup", model="backup",
+                         base_url="https://backup.invalid", api_key_enc="", is_default=True)
+    db.add_all([primary, backup])
+    db.commit()
+    attempts = []
+
+    async def complete(config, messages, timeout, retries):
+        attempts.append(config.model)
+        if config.model == "primary":
+            raise httpx.ConnectError("模拟主模型断线")
+        return "备用模型已响应"
+
+    monkeypatch.setattr(llm, "_complete_with_model", complete)
+
+    async def scenario():
+        with llm.allow_model_failover():
+            for _ in range(2):
+                assert await llm.chat_completion(primary, []) == "备用模型已响应"
+        with pytest.raises(httpx.ConnectError):
+            await llm.chat_completion(primary, [])
+
+    asyncio.run(scenario())
+    assert attempts == ["primary", "backup", "backup", "primary"]
 
 
 @pytest.fixture

@@ -11,12 +11,12 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import assemble, generate, storage, template_parse
+from .. import assemble, generate, review, storage, template_parse
 from .. import operations
 from ..config import settings
 from ..db import SessionLocal, get_db
 from ..deps import get_current_user
-from ..llm import chat_completion
+from ..llm import chat_completion, allow_model_failover, recoverable_model_failure
 from ..report_editorial import make_project_formatter
 from ..models import (
     ChapterTask,
@@ -64,6 +64,7 @@ def project_to_dict(p: Project) -> dict:
         "evidence_path": p.evidence_path,
         "report_path": p.report_path,
         "operation_token": p.operation_token,
+        "auto_report": p.auto_report,
         "material_revision": p.material_revision,
         "last_run_id": p.last_run_id,
         "last_run_result": json.loads(p.last_run_result or "{}"),
@@ -433,7 +434,7 @@ def _parse_ai_json_array(raw: str) -> list[dict]:
 
 
 async def _complete_analysis_json(cfg: ModelConfig, messages: list, *,
-                                  label: str, project_id: int, tag: str = "") -> list[dict]:
+                                  label: str, project_id: int, tag: str = "", validate=None) -> list[dict]:
     """调用模型并要求输出可解析的 JSON 数组；解析失败时让模型自己纠错重出。
 
     最多额外修复 settings.ANALYSIS_JSON_REPAIR_ATTEMPTS 次（0 关闭）；
@@ -447,7 +448,10 @@ async def _complete_analysis_json(cfg: ModelConfig, messages: list, *,
         raw = await chat_completion(cfg, chat_messages, timeout=settings.LLM_REQUEST_TIMEOUT)
         _save_analysis_output(project_id, tag, attempt, raw)
         try:
-            return _parse_ai_json_array(raw)
+            result = _parse_ai_json_array(raw)
+            if validate is not None:
+                validate(result)
+            return result
         except (json.JSONDecodeError, ValueError) as exc:
             last_error = exc
             if attempt >= max_repairs:
@@ -457,7 +461,11 @@ async def _complete_analysis_json(cfg: ModelConfig, messages: list, *,
                            label, exc, attempt, max_repairs)
             chat_messages = chat_messages + [
                 {"role": "assistant", "content": raw},
-                {"role": "user", "content": _JSON_REPAIR_PROMPT.format(error=str(exc))},
+                {"role": "user", "content": (
+                    f"上一条回复无法生成章节任务：{exc}。请按原始要求修正，并只返回完整 JSON 数组。"
+                    if isinstance(exc, InvalidAnalysisPlan)
+                    else _JSON_REPAIR_PROMPT.format(error=str(exc))
+                )},
             ]
     raise ValueError(
         f"{label}不是合法 JSON，已自动请求模型修复 {attempt} 次仍未成功：{last_error}"
@@ -465,7 +473,11 @@ async def _complete_analysis_json(cfg: ModelConfig, messages: list, *,
     ) from last_error
 
 
-async def run_analysis(project_id: int, user_id: int, run_token: str | None = None) -> None:
+class InvalidAnalysisPlan(ValueError):
+    pass
+
+
+async def run_analysis(project_id: int, user_id: int, run_token: str | None = None, *, standalone=True) -> None:
     """后台执行：解析模版 → 拆解章节任务 → 入库；AI 解析时回写带红字指令的模版。"""
     db = SessionLocal()
     uploaded_paths = []
@@ -547,10 +559,19 @@ async def run_analysis(project_id: int, user_id: int, run_token: str | None = No
                 .replace("{references}", refs_text)
                 .replace("{data_summary}", data_text)
             )
+
+            def validate_plan(result):
+                cleaned = template_parse.sanitize_ai_tasks(result, template_parse.extract_code_map(data_text))
+                candidate = template_parse.merge_structure_and_instructions(cleaned, renames, drops, new_secs)
+                if not any(task["task_type"] != "heading" for task in
+                           template_parse.tasks_from_ai_result(blocks, candidate)):
+                    raise InvalidAnalysisPlan("未生成有效指令，请使用模板中的章节标题和有效的写作指令")
+
             # 输出非法 JSON 时把解析错误回传给模型自修复；每轮输出落盘便于排查
             ai_tasks = await _complete_analysis_json(
                 cfg, _sys_msgs() + [{"role": "user", "content": prompt}],
                 label="模版写作指令输出", project_id=project_id,
+                validate=None if standalone else validate_plan,
             )
             # 清洗指令：改写“旧称…统一为…”元语句、英文编码转中文名称，
             # 防止写作 AI 把编辑性表述和编码照抄进报告正文
@@ -579,17 +600,22 @@ async def run_analysis(project_id: int, user_id: int, run_token: str | None = No
         if project.parsed_template_path != parsed_path:
             operations.queue_cleanup(db, project.parsed_template_path)
         save_tasks(db, project_id, tasks)
-        project.status = "analyzed"
+        if standalone:
+            project.status = "analyzed"
+        else:
+            project.status = "generating"
         project.parsed_template_path = parsed_path
         project.evidence_path = ""
         project.error_msg = ""
         db.commit()
-        if token:
+        if token and standalone:
             operations.finish_run(project_id, token, "analyzed", {"succeeded": 1, "failed": 0, "total": 1})
     except Exception as exc:
         logger.exception("analysis failed")
         db.rollback()
         operations.discard_unpublished(uploaded_paths)
+        if not standalone:
+            raise
         msg = f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"[:500]
         if token:
             operations.finish_run(project_id, token, "failed", {"failed": 1, "message": msg})
@@ -913,6 +939,106 @@ async def run_generate_all(project_id: int, user_id: int, run_token: str | None 
                                for task_id in task_ids or []))
     finally:
         _finish_generation(project_id, run_token, task_ids or [])
+
+
+def automatic_modules(db, project):
+    tasks = db.scalars(select(ChapterTask).where(
+        ChapterTask.project_id == project.id, ChapterTask.task_type != "heading",
+    ).order_by(ChapterTask.sort, ChapterTask.id)).all()
+    contents = {content.chapter_task_id: content for content in db.scalars(
+        select(ModuleContent).where(ModuleContent.chapter_task_id.in_([t.id for t in tasks] or [0]),
+                                    ModuleContent.is_current.is_(True)))}
+    pending = [task for task in tasks if not operations.content_is_valid(contents.get(task.id), task, project)]
+    return tasks, pending
+
+
+async def automatic_export(project_id, token):
+    for attempt in range(3):
+        try:
+            async with gen_semaphore():
+                with SessionLocal() as db:
+                    project = operations.ensure_run(db, project_id, token, lock=False)
+                    return await assemble.assemble_report(db, project, run_token=token)
+        except Exception as exc:
+            if attempt == 2 or not (isinstance(exc, (TimeoutError, ConnectionError, review.ReviewUnavailableError))
+                                    or recoverable_model_failure(exc)):
+                raise
+            operations.report_progress(project_id, token, phase="review", label="导出暂时中断，正在自动恢复")
+            await asyncio.sleep(attempt + 1)
+
+
+async def run_automatic_report(project_id: int, user_id: int, token: str) -> None:
+    stage = "分析"
+    try:
+        with allow_model_failover():
+            with SessionLocal() as db:
+                project = operations.ensure_run(db, project_id, token, lock=False)
+                analyze_first = project.status == "analyzing"
+            if analyze_first:
+                operations.report_progress(project_id, token, phase="analysis", label="分析模板与数据")
+                async with gen_semaphore():
+                    await run_analysis(project_id, user_id, token, standalone=False)
+            stage = "内容生成"
+            with operations.project_transaction(project_id) as (db, project):
+                operations.ensure_run(db, project_id, token)
+                tasks, pending = automatic_modules(db, project)
+                if not tasks:
+                    raise ValueError("模板没有可生成的章节")
+                pending_ids = [task.id for task in pending]
+                for task in tasks:
+                    task.status = "queued" if task.id in pending_ids else "done"
+                project.status = "generating"
+            if pending_ids:
+                await asyncio.gather(*(run_generate_one(project_id, task_id, run_token=token, finish=False)
+                                       for task_id in pending_ids))
+            with operations.project_transaction(project_id) as (db, project):
+                operations.ensure_run(db, project_id, token)
+                tasks, pending = automatic_modules(db, project)
+                if pending:
+                    titles = "、".join(task.title[:38] for task in pending[:3])
+                    raise ValueError(f"{len(pending)} 个模块仍未通过校验。{titles}；可在章节历史查看原因")
+                project.status = "assembling"
+            stage = "审核和导出"
+            operations.report_progress(project_id, token, phase="review", label="审核报告")
+            await automatic_export(project_id, token)
+        operations.finish_run(project_id, token, "analyzed",
+                              {"succeeded": 1, "failed": 0, "total": 1, "message": "报告已生成，可下载 Word"})
+    except Exception as exc:
+        logger.exception("Automatic report stopped at %s", stage)
+        with operations.project_transaction(project_id) as (db, project):
+            if project.operation_token != token:
+                return
+            db.query(ChapterTask).filter(ChapterTask.project_id == project_id,
+                                        ChapterTask.status.in_(["queued", "generating"])).update(
+                {"status": "failed"}, synchronize_session=False)
+        operations.finish_run(project_id, token, "failed" if stage == "分析" else "analyzed", {
+            "succeeded": 0, "failed": 1, "total": 1,
+            "message": f"{stage}未完成：{str(exc) or type(exc).__name__}"[:700],
+        })
+    finally:
+        operations.drain_cleanup()
+
+
+def interrupted_automatic_reports():
+    with SessionLocal() as db:
+        return list(db.execute(select(Project.id, Project.user_id, Project.operation_token).where(
+            Project.auto_report.is_(True), Project.operation_token != "")))
+
+
+@router.post("/{project_id}/automatic-report")
+async def start_automatic_report(project_id: int, background: BackgroundTasks,
+                                 user: User = Depends(get_current_user)):
+    with operations.project_transaction(project_id, user.id) as (db, project):
+        if not db.scalar(select(ProjectFile.id).where(ProjectFile.project_id == project_id,
+                                                      ProjectFile.file_type == "template")):
+            raise HTTPException(400, "请先上传 DOCX 模板")
+        if pick_parse_model(db, user.id) is None:
+            raise HTTPException(400, "请先在 AI 配置中添加模型")
+        status = "generating" if project.status == "analyzed" else "analyzing"
+        token = operations.begin_run(db, project, status)
+        project.auto_report = True
+    background.add_task(run_automatic_report, project_id, user.id, token)
+    return {"ok": True, "status": status, "run_id": token}
 
 
 @router.post("/{project_id}/generate")

@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 from app.config import settings
 from app.db import SessionLocal
 from app.main import app
-from app.models import User
+from app.models import ModelConfig, User
 from app.security import create_token
 from app.survey_models import SurveyReport
 from app import survey_worker
@@ -202,6 +202,38 @@ def test_failed_report_can_retry_and_startup_recovers_claim(client, monkeypatch)
         db.execute(update(SurveyReport).where(SurveyReport.id == report_id).values(state="running"))
     survey_worker.recover_interrupted()
     await_state(http, url, lambda row: row["counts"]["done"] == 1)
+
+
+@pytest.mark.parametrize("corrected", [True, False])
+def test_questionnaire_ai_corrects_output_or_completes_without_it(client, db, monkeypatch, corrected):
+    http, _ = client
+    user_id = db.scalar(select(User.id).order_by(User.id))
+    db.add(ModelConfig(user_id=user_id, name="模拟写作 AI", agent_type="write", model="offline",
+                       base_url="https://example.invalid", api_key_enc="", is_default=True))
+    db.commit()
+    base, dataset_id, _ = prepare(http, SMALL)
+    responses = []
+
+    async def fake_model(_config, messages, **_kwargs):
+        responses.append(messages)
+        if corrected and len(responses) > 1:
+            assert "请修正" in messages[-1]["content"]
+            return "学生和教师问卷应分别观察。"
+        return "98% 的答卷支持该观点。"
+
+    monkeypatch.setattr(survey_worker, "chat_completion", fake_model)
+    created = successful(http.post(base + "/batches", json={
+        "dataset_id": dataset_id, "request_id": str(uuid4()), "ai_orgs": [1],
+    }))
+    url = base + "/batches/" + str(created["id"])
+    report = await_state(http, url, lambda row: row["counts"]["done"] == 1)["reports"][0]
+    response = http.get(f"{url}/reports/{report['id']}/download")
+    assert response.is_success
+    paragraphs = "\n".join(p.text for p in Document(io.BytesIO(response.content)).paragraphs)
+    assert "答卷概况" in paragraphs and "98%" not in paragraphs
+    assert ("学生和教师问卷应分别观察" in paragraphs) == corrected
+    assert bool(report["notice"]) != corrected
+    assert len(responses) == (2 if corrected else 3)
 
 
 @pytest.mark.skipif(os.getenv("RUN_SURVEY_LOAD") != "1", reason="千份 Word 压测需显式开启")
