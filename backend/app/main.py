@@ -1,4 +1,5 @@
 """FastAPI 入口。"""
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -11,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from . import storage
 from .config import ROOT_DIR, settings
 from .db import init_db
-from .routers import app_info, auth, dashboard, model_configs, projects, skills
+from .routers import app_info, auth, dashboard, model_configs, projects, skills, surveys
+from . import survey_worker
 from .storage import ensure_bucket
 
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +34,7 @@ app.include_router(model_configs.router)
 app.include_router(projects.router)
 app.include_router(dashboard.router)
 app.include_router(skills.router)
+app.include_router(surveys.router)
 
 
 @app.on_event("startup")
@@ -41,6 +44,22 @@ def startup() -> None:
     _recover_stale_status()
     from .operations import drain_cleanup
     drain_cleanup()
+
+
+@app.on_event("startup")
+async def start_survey_worker() -> None:
+    await asyncio.to_thread(survey_worker.recover_interrupted)
+    app.state.survey_worker = asyncio.create_task(survey_worker.worker())
+
+
+@app.on_event("shutdown")
+async def stop_survey_worker() -> None:
+    task = getattr(app.state, "survey_worker", None)
+    if task:
+        task.cancel()
+        from contextlib import suppress
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def _recover_stale_status() -> None:

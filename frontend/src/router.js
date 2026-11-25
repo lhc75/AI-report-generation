@@ -13,6 +13,7 @@ const routes = [
       // { path: 'statistics', component: () => import('./views/DataStatistics.vue') },
       { path: 'ai-config', component: () => import('./views/ModelConfigs.vue') },
       { path: 'skills', component: () => import('./views/Skills.vue') },
+      { path: 'surveys/:id?', component: () => import('./views/Surveys.vue') },
     ],
   },
 ]

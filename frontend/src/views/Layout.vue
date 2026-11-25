@@ -2,8 +2,9 @@
   <el-container class="layout">
     <el-header class="header">
       <div class="brand">后台管理系统</div>
-      <el-menu mode="horizontal" :default-active="$route.path" router class="menu" :ellipsis="false">
+      <el-menu mode="horizontal" :default-active="$route.path.startsWith('/surveys/') ? '/surveys' : $route.path" router class="menu" :ellipsis="false">
         <el-menu-item index="/projects">我的项目</el-menu-item>
+        <el-menu-item index="/surveys">批量问卷报告</el-menu-item>
         <!-- 暂时关闭数据分析入口 -->
         <!-- <el-menu-item index="/statistics">数据统计</el-menu-item> -->
         <el-menu-item index="/ai-config">AI 配置</el-menu-item>

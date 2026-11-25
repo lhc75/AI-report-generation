@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     OSS_SECRET_KEY: str = "minioadmin"
     OSS_BUCKET: str = "knowledge-media"
     OSS_PRESIGN_EXPIRE_SECONDS: int = 3600
+    SURVEY_DATA_DIR: str = ""  # 批量报告私有目录，默认位于本地存储目录旁
+    SURVEY_REPORT_WORKERS: int = 2
 
     # 安全
     MODEL_CONFIG_ENCRYPTION_KEY: str = ""

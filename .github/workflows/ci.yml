@@ -39,6 +39,11 @@ jobs:
           python-version: '3.13'
       - name: Syntax check
         run: python -m compileall -q backend/app
+      - name: Install backend test dependencies
+        run: python -m pip install -r backend/requirements-dev.txt
+      - name: Exercise survey import and report downloads
+        working-directory: backend
+        run: python -m pytest -q tests/test_survey_batch.py
 
   desktop:
     runs-on: ubuntu-latest

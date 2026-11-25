@@ -55,7 +55,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def init_db() -> None:
-    from . import models  # noqa: F401  确保模型已注册
+    from . import models, survey_models  # noqa: F401  确保模型已注册
 
     if settings.DB_ENGINE == "mysql":
         ensure_database()

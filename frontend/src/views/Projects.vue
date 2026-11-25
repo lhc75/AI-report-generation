@@ -2,30 +2,45 @@
   <div>
     <div class="toolbar">
       <h3 class="page-title">我的项目</h3>
-      <el-button type="primary" :icon="Plus" @click="dialogVisible = true">新建项目</el-button>
+      <el-button type="primary" :icon="Plus" @click="openCreate">新建项目</el-button>
     </div>
     <el-table :data="projects" v-loading="loading" border>
       <el-table-column prop="name" label="项目名称" min-width="200" />
+      <el-table-column label="报告模式" width="148">
+        <template #default="{ row }">{{ modes[row.mode] }}</template>
+      </el-table-column>
       <el-table-column label="状态" width="110">
         <template #default="{ row }">
-          <el-tag :type="statusType(row.status)">{{ statusText(row.status) }}</el-tag>
+          <el-tag :type="statusType(row.status)">{{ row.mode === 'survey' ? (row.dataset_id ? '已导入' : '待导入') : statusText(row.status) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="created_at" label="创建时间" width="170" />
       <el-table-column label="操作" width="160">
         <template #default="{ row }">
-          <el-button type="primary" link @click="$router.push(`/projects/${row.id}`)">进入</el-button>
-          <el-button type="danger" link :loading="deletingId === row.id" @click="remove(row)">删除</el-button>
+          <el-button type="primary" link @click="openProject(row)">进入</el-button>
+          <el-button v-if="row.mode === 'general'" type="danger" link :loading="deletingId === row.id" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
       <template #empty>暂无项目，点击右上角新建</template>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" title="新建项目" width="420px">
-      <el-input v-model="name" placeholder="请输入项目名称" maxlength="100" />
+    <el-dialog v-model="dialogVisible" title="新建项目" width="min(485px, 96vw)">
+      <el-form label-width="85px" @submit.prevent="create">
+        <el-form-item label="报告模式">
+          <el-radio-group v-model="mode">
+            <el-radio-button value="general">通用 AI 报告</el-radio-button>
+            <el-radio-button value="survey">批量问卷报告</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="项目名称"><el-input v-model="name" placeholder="请输入项目名称" maxlength="100" /></el-form-item>
+        <template v-if="mode === 'survey'">
+          <el-form-item label="省份"><el-input v-model="province" maxlength="100" /></el-form-item>
+          <el-form-item label="年度"><el-input-number v-model="year" :min="1900" :max="2200" /></el-form-item>
+        </template>
+      </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="creating" @click="create">创建</el-button>
+        <el-button type="primary" :loading="creating" :disabled="!name.trim() || (mode === 'survey' && !province.trim())" @click="create">创建</el-button>
       </template>
     </el-dialog>
   </div>
@@ -43,6 +58,10 @@ const projects = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const name = ref('')
+const mode = ref('general')
+const province = ref('')
+const year = ref(new Date().getFullYear())
+const modes = { general: '通用 AI 报告', survey: '批量问卷报告' }
 const creating = ref(false)
 const deletingId = ref(null)
 
@@ -56,19 +75,38 @@ function statusText(s) {
 async function load() {
   loading.value = true
   try {
-    projects.value = (await api.get('/projects')).data
+    const results = await Promise.allSettled([api.get('/projects'), api.get('/surveys')])
+    projects.value = results.flatMap((result, index) => result.status === 'fulfilled'
+      ? result.value.data.map(row => ({ ...row, mode: index ? 'survey' : 'general' }))
+      : projects.value.filter(row => row.mode === (index ? 'survey' : 'general')))
   } finally {
     loading.value = false
   }
 }
 
+function openCreate() {
+  name.value = ''
+  province.value = ''
+  mode.value = 'general'
+  dialogVisible.value = true
+}
+
+function openProject(row) {
+  return router.push((row.mode === 'survey' ? '/surveys/' : '/projects/') + row.id)
+}
+
 async function create() {
-  if (!name.value.trim()) return
+  if (!name.value.trim() || creating.value || (mode.value === 'survey' && !province.value.trim())) return
   creating.value = true
+  const kind = mode.value
   try {
-    const { data } = await api.post('/projects', { name: name.value.trim() })
+    const fields = { name: name.value.trim() }
+    if (kind === 'survey') Object.assign(fields, { province: province.value.trim(), year: year.value })
+    const { data } = await api.post(kind === 'survey' ? '/surveys' : '/projects', fields)
     dialogVisible.value = false
-    router.push(`/projects/${data.id}`)
+    openProject({ id: data.id, mode: kind })
+  } catch {
+    // The API interceptor reports validation and server errors.
   } finally {
     creating.value = false
   }
