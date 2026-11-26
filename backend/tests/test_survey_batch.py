@@ -28,7 +28,7 @@ from app.security import create_token
 from app.survey_models import SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyProject, SurveyReport, SurveyReportDraft
 from app import survey_ai, survey_authoring, survey_worker
 from app.survey_reports import chart_image
-from app.survey_templates import parse_report
+from app.survey_templates import extract_report_layout
 
 
 def workbook(rows):
@@ -106,9 +106,50 @@ SMALL = [
 ]
 
 
-def test_complete_word_report_parsing_versions_and_download(client, db):
+def test_complete_word_report_parsing_versions_and_download(client, db, monkeypatch):
     http, other = client
     base, dataset_id, _ = prepare(http, SMALL)
+    owner = db.scalar(select(User).where(User.username == "batch-owner"))
+    db.add(ModelConfig(user_id=owner.id, name="测试解析模型", agent_type="parse", base_url="http://localhost",
+                       api_key_enc="", model="test", is_default=True))
+    db.commit()
+    reference = Document()
+    reference.add_paragraph("六年级学生满意度题及选项说明")
+    ref = io.BytesIO()
+    reference.save(ref)
+    successful(http.post(base + "/assets", data={"kind": "questionnaire"},
+                         files={"file": ("学生.docx", ref.getvalue())}))
+    book = Workbook()
+    book.active.append(["指标", "填报口径"])
+    book.active.append(["满意度", "按有效作答计算比例"])
+    indicators = io.BytesIO()
+    book.save(indicators)
+    successful(http.post(base + "/assets", data={"kind": "indicator"},
+                         files={"file": ("年度指标.xlsx", indicators.getvalue())}))
+    successful(http.post(base + "/assets", data={"kind": "school"},
+                         files={"file": ("学校.xlsx", roster_xlsx([("11", "同名学校", "小学")]))}))
+    calls = []
+
+    async def model(config, messages, **kwargs):
+        payload = json.loads(messages[1]["content"])
+        calls.append(payload)
+        assert config.agent_type == "parse"
+        if "章节位置" not in payload:
+            return json.dumps({"summary": "核对题目后按有效作答统计"})
+        assert set(payload["资料摘要"]) == {"学生.docx", "年度指标.xlsx"}
+        assert payload["学校学段汇总"]["primary"] == 1
+        assert payload["答卷文件"] == ["答卷.xlsx"]
+        assert any(q["题干"] == "满意度" for q in payload["答卷题库"])
+        return json.dumps({"sections": [{
+            "id": section["id"], "role": "scope" if section["章节"][-1] == "答卷范围" else "findings",
+            "questionnaire_ids": None,
+            "modules": [{
+                "id": slot["id"], "kind": "table" if "按有效答卷汇总" in slot["原文"] else slot["原类型"],
+                "instruction": "按有效答卷汇总" if "按有效答卷汇总" in slot["原文"] else "按年度资料核对本章指标和分母",
+            } for slot in section["modules"]],
+        } for section in payload["章节位置"]]})
+
+    monkeypatch.setattr(survey_ai, "chat_completion", model)
     example = Document()
     example.sections[0].header.paragraphs[0].text = "监测页眉"
     example.add_paragraph("原报告封面", "Title")
@@ -139,6 +180,7 @@ def test_complete_word_report_parsing_versions_and_download(client, db):
 
     result = parsed(template_id)
     assert result["ready"]
+    assert len(calls) == 3
     assert [section["path"] for section in result["sections"]] == [["答卷范围"], ["监测发现"], ["监测发现", "统计观察"]]
     assert [m["kind"] for m in result["sections"][-1]["modules"]] == ["text", "image", "table"]
     assert result["sections"][-1]["modules"][-1]["instruction"] == "【生成表格】按有效答卷汇总"
@@ -152,6 +194,7 @@ def test_complete_word_report_parsing_versions_and_download(client, db):
     assert not red_doc.tables and not red_doc.inline_shapes
     assert all("999999" not in p.text for p in red_doc.paragraphs)
     assert any(p.text == "【生成表格】按有效答卷汇总" for p in red_doc.paragraphs)
+    assert any(p.text == "【撰写正文】按年度资料核对本章指标和分母" for p in red_doc.paragraphs)
 
     invalid = successful(http.post(base + "/assets", data=form,
                          files={"file": ("无章节.docx", docx_template("没有章节"))}))
@@ -187,6 +230,23 @@ def test_complete_word_report_parsing_versions_and_download(client, db):
     assert http.delete(f"{base}/assets/{template_id}").is_success
     assert http.get(output_url).content == output.content
 
+    long_report = Document()
+    for index in range(158):
+        long_report.add_heading(f"监测指标 {index + 1}", 1)
+        long_report.add_paragraph("监测数据示例")
+    long_buffer = io.BytesIO()
+    long_report.save(long_buffer)
+    before = len(calls)
+    long_asset = successful(http.post(base + "/assets", data=form,
+                            files={"file": ("长报告.docx", long_buffer.getvalue())}))
+    assert len(parsed(long_asset["id"])["sections"]) == 158
+    assert len(calls) - before == 18
+
+    successful(http.post(base + "/assets", data={"kind": "data"},
+                         files={"file": ("待导入.xlsx", workbook(SMALL[:1]))}))
+    pending = http.post(base + "/assets", data=form, files={"file": ("待检查.docx", raw)})
+    assert pending.status_code == 409 and "未导入" in pending.json()["detail"]
+
 
 def test_inferred_interest_table_recalculates_only_selected_student_questionnaires(tmp_path):
     source = Document()
@@ -199,7 +259,8 @@ def test_inferred_interest_table_recalculates_only_selected_student_questionnair
     source.add_picture(chart_image([("六年级数学", 999)], 999))
     template = tmp_path / "sample.docx"
     source.save(template)
-    sections = parse_report(template.read_bytes())
+    sections = extract_report_layout(template.read_bytes())
+    sections[0]["role"] = "metrics"
     assert sections[0]["measure"] == "course_interest"
     surveys = [{"id": 2, "name": "学生问卷-九年级数学", "sample": 5, "indicators": [],
                 "questions": [{"id": 1, "title": "你喜欢上数学课。", "kind": "single",

@@ -100,6 +100,11 @@ def purge_archived_inputs(project_id):
         for batch in batches:
             references.update(batch.config.get("indicator_assets", []))
             references.update(item["asset_id"] for item in batch.config.get("questionnaire_originals", []))
+        parses = db.scalars(select(SurveyAsset).join(SurveyTemplateParse, SurveyTemplateParse.id == SurveyAsset.id)
+                            .where(SurveyAsset.project_id == project_id, SurveyTemplateParse.state.in_(ACTIVE)))
+        for asset in parses:
+            batch_datasets.add(asset.details.get("dataset_id"))
+            references.update(asset.details.get("material_ids", []))
         versions = db.scalars(select(SurveyDataset).where(SurveyDataset.project_id == project_id))
         root = project_dir(project_id, create=False)
         for version in versions:

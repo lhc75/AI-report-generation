@@ -156,13 +156,15 @@
       <el-tab-pane label="Word 模板" name="templates">
         <div class="toolbar">
           <el-select v-model="uploadLevel" class="medium-select" aria-label="模板层级"><el-option v-for="[value, label] in levels" :key="value" :value="value" :label="label" /></el-select>
-          <label class="upload"><el-icon><Upload /></el-icon> 上传报告并解析
-            <input aria-label="上传报告并解析" type="file" accept=".docx" multiple :disabled="busy" @change="uploadFiles($event, 'template', true)" />
+          <label class="upload"><el-icon><Upload /></el-icon> 上传 Word 并用 AI 解析
+            <input aria-label="上传 Word 并用 AI 解析" type="file" accept=".docx" multiple
+                   :disabled="busy || !canParseTemplate" @change="uploadFiles($event, 'template', true)" />
           </label>
           <label class="upload"><el-icon><Upload /></el-icon> 上传占位符模板
             <input type="file" accept=".docx" multiple :disabled="busy" @change="uploadFiles($event, 'template')" />
           </label>
         </div>
+        <el-text v-if="!canParseTemplate" type="info" size="small">请先上传全部资料并完成答卷导入。</el-text>
         <div v-for="entry in uploadFeedback.template" :key="entry.key" class="survey-file">
           <span>{{ entry.name }}</span><el-text :type="entry.error ? 'danger' : 'info'">{{ entry.error || '上传中' }}</el-text>
         </div>
@@ -181,8 +183,8 @@
               <template v-if="row.structured">
                 <el-button v-if="row.ready" link type="primary" @click="editTemplate(row)">章节预览</el-button>
                 <el-button link @click="downloadTemplate(row, false)">原稿</el-button>
-                <el-button v-if="row.ready" link @click="downloadTemplate(row, true)">红字模板</el-button>
-                <el-button v-if="row.ready || row.parse_state === 'failed'" link :disabled="busy" @click="reparseTemplate(row)">{{ row.ready ? '重新解析' : '重试' }}</el-button>
+                <el-button v-if="row.ready" link @click="downloadTemplate(row, true)">下载新模板</el-button>
+                <el-button v-if="row.ready || row.parse_state === 'failed'" link :disabled="busy || !canParseTemplate" @click="reparseTemplate(row)">{{ row.ready ? '重新解析' : '重试' }}</el-button>
               </template>
               <el-button v-else link type="primary" @click="editTemplate(row)">预览与定位</el-button>
               <el-button link type="danger" :disabled="busy || templateParsing(row)" :aria-label="'删除 ' + row.name" @click="removeAsset(row)">删除</el-button>
@@ -509,6 +511,8 @@ const templates = computed(() => project.value?.assets.filter(asset => asset.kin
 const indicatorAssets = computed(() => project.value?.assets.filter(asset => asset.kind === 'indicator') || [])
 const schoolRoster = computed(() => project.value?.assets.find(asset => asset.kind === 'school'))
 const importing = computed(() => ['queued', 'running'].includes(project.value?.latest_import?.state))
+const canParseTemplate = computed(() => !!project.value?.dataset_id && !importing.value
+  && sources.value.every(source => importedSources.value.has(source.id)))
 const uploadLevel = ref('province')
 const templateOpen = ref(false)
 const templateDraft = ref(null)

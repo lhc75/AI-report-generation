@@ -222,11 +222,33 @@ def save_upload(stream, path):
     return digest.hexdigest()
 
 
+def template_snapshot(db, project):
+    if active_import(db, project.id):
+        raise HTTPException(409, "答卷正在导入，请在导入完成后上传 Word 模板")
+    current = db.get(SurveyDataset, project.dataset_id) if project.dataset_id else None
+    if not current or current.state != "done" or not index_path(project.id, current.id).is_file():
+        raise HTTPException(409, "请先上传全部答卷并完成导入，再上传 Word 模板")
+    assets = list(db.scalars(select(SurveyAsset).where(
+        SurveyAsset.project_id == project.id, SurveyAsset.archived.is_(False),
+        SurveyAsset.kind.in_(("data", "questionnaire", "indicator", "school"))
+    ).order_by(SurveyAsset.id)))
+    imported = {source["asset_id"] for source in current.sources}
+    if any(row.kind == "data" and row.id not in imported for row in assets):
+        raise HTTPException(409, "还有答卷文件未导入，请完成导入后再进行 AI 解析")
+    school = next((row for row in assets if row.kind == "school"), None)
+    versions = db.scalars(select(SurveyIndicatorVersion.id).where(
+        SurveyIndicatorVersion.project_id == project.id, SurveyIndicatorVersion.dataset_id == current.id
+    ).order_by(SurveyIndicatorVersion.id))
+    return {"dataset_id": current.id, "material_ids": [row.id for row in assets if row.kind != "data"],
+            "indicator_version_ids": list(versions), "school_counts": school.details["counts"] if school else None,
+            "questionnaire_links": {str(row.id): row.details for row in assets if row.kind == "questionnaire"}}
+
+
 @router.post("/{project_id}/assets")
 def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level | None = Form(None),
            parse_report: bool = Form(False),
            user: User = Depends(get_current_user), db: WriteSession = None):
-    owned(db, project_id, user, write=True)
+    project = owned(db, project_id, user, write=True)
     name = file.filename or ""
     extension = Path(name).suffix.lower()
     allowed = {"data": ANSWER_EXTENSIONS, "template": {".docx"}, "indicator": {".xlsx", ".docx", ".pdf"},
@@ -235,6 +257,7 @@ def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level |
         raise HTTPException(422, "请选择有效的文件格式和文件名")
     if kind == "template" and level is None:
         raise HTTPException(422, "请选择模板所属层级")
+    snapshot = template_snapshot(db, project) if kind == "template" and parse_report else {}
     if kind == "school":
         if not file.size or file.size > MAX_UPLOAD:
             raise HTTPException(422, "请选择非空且不超过 200 MB 的学校信息表")
@@ -261,13 +284,14 @@ def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level |
                               .order_by(SurveyAsset.id.desc()))
         for row in existing:
             if kind != "template" or (row.details["level"] == level and bool(row.details.get("structured")) == parse_report):
-                return asset_values(row, db.get(SurveyTemplateParse, row.id))
+                if all(row.details.get(key) == value for key, value in snapshot.items()):
+                    return asset_values(row, db.get(SurveyTemplateParse, row.id))
         if kind == "data":
             details = {"sheets": inspect_workbook(path, name)}
         elif kind == "template":
             details = {"level": level, "ready": False}
             if parse_report:
-                details.update(structured=True, dataset_id=db.get(SurveyProject, project_id).dataset_id)
+                details.update(structured=True, **snapshot)
             else:
                 details.update(template_preview(path))
         elif kind == "questionnaire":
@@ -387,10 +411,11 @@ def parse_template_again(project_id: int, asset_id: int, user: User = Depends(ge
         raise HTTPException(422, "请选择从完整报告解析的模板")
     if parsing.state in ACTIVE:
         return asset_values(row, parsing)
+    snapshot = template_snapshot(db, project)
     if parsing.state == "done":
         row = SurveyAsset(project_id=project_id, kind=row.kind, name=row.name, path=row.path, digest=row.digest,
                           details={"level": row.details["level"], "ready": False, "structured": True,
-                                   "dataset_id": project.dataset_id, "previous_version": row.id})
+                                   "previous_version": row.id, **snapshot})
         db.add(row)
         db.flush()
         parsing = SurveyTemplateParse(id=row.id)
@@ -398,7 +423,7 @@ def parse_template_again(project_id: int, asset_id: int, user: User = Depends(ge
     else:
         parsing.state = "queued"
         parsing.error = ""
-        row.details = {**row.details, "dataset_id": project.dataset_id}
+        row.details = {**row.details, **snapshot}
     db.commit()
     return asset_values(row, parsing)
 

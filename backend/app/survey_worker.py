@@ -30,7 +30,7 @@ from .survey_references import analyze_original, linked_questionnaire
 from .survey_reports import build_word, report_data
 from .survey_schools import school_path
 from .survey_storage import lock_project, project_dir, recover_deleted_projects
-from .survey_templates import parse_report, save_red_template
+from .survey_templates import analyze_report_template, extract_report_layout, material_chunks, save_red_template
 
 logger = logging.getLogger(__name__)
 
@@ -122,53 +122,86 @@ def process_import(dataset_id: int):
         project.dataset_id = dataset_id
 
 
-def process_template(asset_id: int):
+def template_inputs(asset_id: int):
     with SessionLocal() as db:
         asset = db.get(SurveyAsset, asset_id)
         project_id, details = asset.project_id, asset.details
+        project = db.get(SurveyProject, project_id)
         root = project_dir(project_id)
         raw = (root / asset.path).read_bytes()
-        questionnaires = []
-        source_index = index_path(project_id, details["dataset_id"]) if details.get("dataset_id") else None
-        if source_index and source_index.is_file():
-            with closing(open_index(source_index)) as index:
-                questionnaires = [dict(row) for row in index.execute("SELECT id,name FROM questionnaire")]
-        originals = list(db.scalars(select(SurveyAsset).where(
-            SurveyAsset.project_id == project_id, SurveyAsset.kind == "questionnaire", SurveyAsset.archived.is_(False))))
-        sources = [(original.name, linked_questionnaire(original.name, original.details, questionnaires))
-                   for original in originals]
+        config = model_for(db, project.user_id, "parse") or model_for(db, project.user_id, "analyze")
+        dataset_id = details.get("dataset_id")
+        if not dataset_id or not index_path(project_id, dataset_id).is_file():
+            raise ValueError("请先完成答卷导入，再重试 AI 解析")
+        ids = details.get("material_ids")
+        materials_query = select(SurveyAsset).where(SurveyAsset.project_id == project_id,
+                                                    SurveyAsset.kind.in_(("questionnaire", "indicator", "school")))
+        assets = list(db.scalars(materials_query.where(
+            SurveyAsset.id.in_(ids) if ids is not None else SurveyAsset.archived.is_(False)
+        ).order_by(SurveyAsset.id)))
+        versions = select(SurveyIndicatorVersion).where(SurveyIndicatorVersion.project_id == project_id,
+                                                       SurveyIndicatorVersion.dataset_id == dataset_id)
+        if "indicator_version_ids" in details:
+            versions = versions.where(SurveyIndicatorVersion.id.in_(details["indicator_version_ids"]))
+        latest_rules = {}
+        for row in db.scalars(versions.order_by(SurveyIndicatorVersion.id)):
+            latest_rules[row.asset_id] = row.rules
+        version = db.get(SurveyDataset, dataset_id)
+        source_names = [db.get(SurveyAsset, source["asset_id"]).name for source in version.sources]
+        with closing(open_index(index_path(project_id, dataset_id))) as index:
+            questionnaires = [dict(row) for row in index.execute(
+                "SELECT q.id,q.name,COALESCE(s.total,0) AS responses FROM questionnaire q "
+                "LEFT JOIN sample s ON s.questionnaire=q.id AND s.org=1 ORDER BY q.id")]
+            questions = catalog_for_rules(index)
+            org_counts = dict(index.execute("SELECT level,COUNT(*) FROM org GROUP BY level").fetchall())
+        school = next((row for row in assets if row.kind == "school"), None)
+        evidence = {"报告年度": project.year, "省份": project.province, "报告层级": details["level"],
+                    "答卷文件": source_names, "问卷": questionnaires, "学校学段汇总": (details.get("school_counts")
+                        if "school_counts" in details else school.details.get("counts") if school else None),
+                    "各层级参测单位数": org_counts, "已配置年度指标": list(latest_rules.values()),
+                    "答卷题库": [{"id": q["id"], "问卷ID": q["questionnaire_id"], "题干": q["title"],
+                                  "题型": q["kind"], "选项": [option[:80] for option in q["options"][:15]]}
+                                 for q in questions.values()]}
+        originals = {}
+        for original in assets:
+            if original.kind == "questionnaire":
+                original_details = details.get("questionnaire_links", {}).get(str(original.id), original.details)
+                match = linked_questionnaire(original.name, original_details, questionnaires)
+                if match:
+                    originals.setdefault(match["id"], []).append(original.name)
+        material_files = [(row.name, root / row.path, row.kind) for row in assets if row.kind != "school"]
+    return config, root, raw, evidence, material_files, {q["id"]: q["name"] for q in questionnaires}, originals
+
+
+def template_layout(raw, material_files):
     try:
-        sections = parse_report(raw)
+        sections = extract_report_layout(raw)
     except (BadZipFile, PackageNotFoundError, XMLSyntaxError, KeyError) as exc:
         raise ValueError("Word 文件无法打开，请另存为有效的 .docx 文件") from exc
-    source_names = {match["name"]: name for name, match in sources if match}
-    for section in sections:
-        title = " ".join(section["path"])
-        subjects = [word for word in ("数学", "英语", "科学", "物理") if word in title]
-        roles = [word for word in ("校长", "教师", "学生") if word in title]
-        grades = [word for word in ("六年级", "九年级") if word in title]
-        scoped = bool(subjects or roles or grades)
-        matches = [row["name"] for row in questionnaires if scoped
-            and (not subjects or any(word in row["name"] for word in subjects))
-            and (not roles or any(word in row["name"] for word in roles))
-            and (not grades or any(word in row["name"] for word in grades))
-        ]
-        section["questionnaires"] = matches if scoped and questionnaires else None
-        section["references"] = [source_names[name] for name in matches if name in source_names]
-        if matches:
-            for module in section["modules"]:
-                if module.get("inferred", True):
-                    module["instruction"] += " 核对问卷：" + "、".join(matches) + "。"
+    return sections, [chunk for file in material_files for chunk in material_chunks(*file)]
+
+
+def publish_template(asset_id, root, raw, sections):
     temp = root / f"template-{asset_id}-working.docx"
     try:
         save_red_template(raw, sections, temp)
         temp.replace(root / f"template-{asset_id}-parsed.docx")
         with SessionLocal.begin() as db:
             asset = db.get(SurveyAsset, asset_id)
-            asset.details = {**details, "sections": sections, "ready": True}
+            asset.details = {**asset.details, "sections": sections, "ready": True}
             db.get(SurveyTemplateParse, asset_id).state = "done"
     finally:
         temp.unlink(missing_ok=True)
+
+
+async def process_template(asset_id: int):
+    config, root, raw, evidence, files, questionnaires, originals = await job_thread(template_inputs, asset_id)
+    sections, chunks = await job_thread(template_layout, raw, files)
+    if config is None:
+        raise ValueError("请在 AI 配置中设置默认解析模型")
+    sections = await analyze_report_template(
+        config, sections, evidence, chunks, questionnaires, originals, settings.LLM_REQUEST_TIMEOUT)
+    await job_thread(publish_template, asset_id, root, raw, sections)
 
 
 def preparation_inputs(batch_id):
@@ -568,7 +601,7 @@ async def run_job(table, id_):
             if table is SurveyDataset:
                 await asyncio.to_thread(process_import, id_)
             elif table is SurveyTemplateParse:
-                await asyncio.to_thread(process_template, id_)
+                await process_template(id_)
             elif table is SurveyBatchPreparation:
                 await process_preparation(id_)
             else:
