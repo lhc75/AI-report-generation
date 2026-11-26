@@ -28,6 +28,7 @@ from app.security import create_token
 from app.survey_models import SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyProject, SurveyReport, SurveyReportDraft
 from app import survey_ai, survey_authoring, survey_worker
 from app.survey_reports import chart_image
+from app.survey_templates import parse_report
 
 
 def workbook(rows):
@@ -185,6 +186,34 @@ def test_complete_word_report_parsing_versions_and_download(client, db):
     assert all("999999" not in p.text and p.text not in {"原属地", "旧报告正文", "原报告封面"} for p in doc.paragraphs)
     assert http.delete(f"{base}/assets/{template_id}").is_success
     assert http.get(output_url).content == output.content
+
+
+def test_inferred_interest_table_recalculates_only_selected_student_questionnaires(tmp_path):
+    source = Document()
+    source.add_heading("学生学习态度", 1)
+    table = source.add_table(2, 3)
+    for cell, text in zip(table.rows[0].cells, ["学段与学科", "完全或基本符合", "不确定"]):
+        cell.text = text
+    table.cell(1, 0).text = "六年级数学"
+    table.cell(1, 1).text = "999 / 999"
+    source.add_picture(chart_image([("六年级数学", 999)], 999))
+    template = tmp_path / "sample.docx"
+    source.save(template)
+    sections = parse_report(template.read_bytes())
+    assert sections[0]["measure"] == "course_interest"
+    surveys = [{"id": 2, "name": "学生问卷-九年级数学", "sample": 5, "indicators": [],
+                "questions": [{"id": 1, "title": "你喜欢上数学课。", "kind": "single",
+                               "n": 4, "options": {"完全符合": 1, "基本符合": 2, "不确定": 1}}]}]
+    result = tmp_path / "new.docx"
+    survey_authoring.render_structured_word(
+        result, title="测试报告", org="初中", template=(template, {}), sections=sections, surveys=surveys,
+        draft=[{"key": "metrics", "text": "课程喜爱题分学科列示。"}], facts={}, annual=[], missing=[])
+    reproduced = Document(result)
+    assert [cell.text for cell in reproduced.tables[0].rows[1].cells] == [
+        "九年级数学", "3 / 4（75.0%）", "1 / 4（25.0%）",
+    ]
+    assert len(reproduced.inline_shapes) == 1
+    assert not any("六年级" in paragraph.text for paragraph in reproduced.paragraphs)
 
 
 def roster_xlsx(rows):

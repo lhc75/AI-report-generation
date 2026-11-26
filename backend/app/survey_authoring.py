@@ -337,6 +337,31 @@ def annual_for_surveys(items, surveys, all_surveys):
             or (item.get("questionnaire_id") is None and len(surveys) == len(all_surveys))]
 
 
+def course_interest(surveys):
+    results = []
+    for survey in surveys:
+        if "学生问卷" not in survey["name"]:
+            continue
+        matching = [q for q in survey["questions"] if q["n"] and q["kind"] == "single"
+                    and re.search(r"你喜欢上[^，。？！]{1,12}课", q["title"])
+                    and q["options"].keys() <= {"完全符合", "基本符合", "不确定", "不太符合", "完全不符合"}]
+        if len(matching) != 1:
+            continue
+        question = matching[0]
+        counts = question["options"]
+        name = survey["name"].split("学生问卷", 1)[-1].lstrip("-—（(") or survey["name"]
+        agree = counts.get("完全符合", 0) + counts.get("基本符合", 0)
+        results.append((name, agree, counts.get("不确定", 0), question["n"]))
+    return sorted(results, key=lambda row: (not row[0].startswith("六年级"), row[0]))
+
+
+def interest_table(doc, rows):
+    def share(count, total):
+        return f"{count:,} / {total:,}（{count / total:.1%}）"
+    add_table(doc, ("学段与学科", "完全或基本符合", "不确定"),
+              [(name, share(agree, n), share(unsure, n)) for name, agree, unsure, n in rows])
+
+
 def structured_table(doc, role, surveys, annual, missing, question):
     configured = [item for survey in surveys for item in survey["indicators"]]
     if role == "scope":
@@ -384,6 +409,8 @@ def render_structured_word(path, *, title, org, template, sections, draft, facts
         selected = template_surveys(section, surveys)
         section_annual = annual_for_surveys(annual, selected, surveys)
         section_missing = annual_for_surveys(missing, selected, surveys)
+        interest = course_interest(selected) if section.get("measure") == "course_interest" else None
+        scope_written = False
         for index, module in enumerate(section["modules"]):
             before = list(doc.element.body)
             kind = module["kind"]
@@ -399,20 +426,27 @@ def render_structured_word(path, *, title, org, template, sections, draft, facts
                     p.add_run(clean_text(content["text"]))
                     written_roles.add(role)
                 survey_name, question = template_question(selected, section, index)
-                if role == "scope":
+                if role == "scope" and not scope_written:
                     p.add_run(f" 本节纳入 {sum(s['sample'] for s in selected):,} 份答卷。")
+                    scope_written = True
                     if any(0 < s["sample"] < 10 for s in selected):
                         p.add_run(" 小样本结果仅描述实际作答。")
+                elif role == "scope" and not p.text:
+                    p.add_run("各问卷按有效作答分别统计。")
                 elif role == "metrics" and "缺项" in section["title"]:
                     if section_missing or any(item.get("reason") for item in section_annual):
                         for item in section_missing + [item for item in section_annual if item.get("reason")]:
                             doc.add_paragraph(clean_text(f"{item['name']}。{item['reason']}"))
                     else:
                         p.add_run(" 本节按当前有效作答和已确认的统计口径呈现。")
+                elif interest is not None:
+                    if not p.text:
+                        p.add_run("按学段和学科分别呈现实际作答。" if interest else "本节没有符合口径的有效作答。")
                 elif question and role in {"metrics", "findings"}:
                     option, count = next(iter(question["options"].items()))
+                    result = f"{count:,} 份" if question["n"] < 10 else f"{count:,} 份（{count / question['n']:.1%}）"
                     p.add_run(clean_text(f" {survey_name}中「{question['title']}」有 {question['n']:,} 份有效作答，"
-                                         f"「{option}」为 {count:,} 份（{count / question['n']:.1%}）。"))
+                                         f"「{option}」为 {result}。"))
                 elif not p.text:
                     p.add_run(clean_text(f"本节以{names}的实际作答为统计范围。" if names else "本节暂无可用数据。"))
                 if role == "findings" and not section.get("questionnaires"):
@@ -422,7 +456,17 @@ def render_structured_word(path, *, title, org, template, sections, draft, facts
                         doc.add_paragraph(clean_text(value))
             else:
                 survey_name, question = template_question(selected, section, 0)
-                if kind == "table":
+                if interest is not None:
+                    if not interest:
+                        doc.add_paragraph("本节没有符合课程喜爱题口径的有效作答。")
+                    elif kind == "table":
+                        interest_table(doc, interest)
+                    else:
+                        rows = [(name, round(agree * 10000 / n)) for name, agree, _, n in interest]
+                        doc.add_paragraph("图　各学科学生选择「完全符合」或「基本符合」的比例")
+                        doc.add_picture(chart_image(rows, 10000), width=Cm(12))
+                        doc.add_paragraph("　".join(f"{i} {name}" for i, (name, _) in enumerate(rows, 1)))
+                elif kind == "table":
                     if question and role not in {"scope", "metrics"}:
                         doc.add_paragraph(clean_text(f"{survey_name} · {question['title']}"))
                     structured_table(doc, role, selected, section_annual, section_missing, question)

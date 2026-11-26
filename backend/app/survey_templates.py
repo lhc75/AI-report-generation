@@ -26,6 +26,12 @@ DEFAULT_INSTRUCTIONS = {
 KIND_LABELS = {"text": "撰写正文", "table": "生成表格", "image": "生成图片"}
 
 
+def inferred_measure(columns):
+    if any("完全或基本符合" in column for column in columns) and any("不确定" in column for column in columns):
+        return "course_interest"
+    return None
+
+
 def parse_report(raw: bytes) -> list[dict]:
     doc = Document(io.BytesIO(raw))
     structure = template_parse.extract_structure(raw)
@@ -81,8 +87,9 @@ def parse_report(raw: bytes) -> list[dict]:
             module.setdefault("instruction", f"【{KIND_LABELS[module['kind']]}】围绕“{title}”{DEFAULT_INSTRUCTIONS[role]}。")
             if module.get("columns"):
                 module["instruction"] += " 原表列名：" + "、".join(module["columns"]) + "。"
+        measure = next((matched for module in modules if (matched := inferred_measure(module.get("columns", [])))), None)
         section = {"title": title, "depth": depth, "heading": start, "role": role,
-                   "path": [item["title"] for item in stack] + [title], "modules": modules}
+                   "path": [item["title"] for item in stack] + [title], "modules": modules, "measure": measure}
         sections.append(section)
         stack.append(section)
     return sections
