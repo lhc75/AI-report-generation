@@ -5,7 +5,7 @@ import errno
 import json
 import logging
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from pathlib import Path
 from time import monotonic
 from zipfile import BadZipFile
@@ -62,6 +62,19 @@ def recover_interrupted():
     with SessionLocal.begin() as db:
         for table in (SurveyDataset, SurveyTemplateParse, SurveyBatchPreparation, SurveyReport):
             db.execute(update(table).where(table.state == "running").values(state="queued", error=""))
+        for table in (SurveyBatchPreparation, SurveyReport):
+            db.execute(update(table).where(table.state == "stopping").values(state="stopped"))
+
+
+async def job_thread(operation, *args, **kwargs):
+    task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A filesystem or database operation in a thread must finish before the batch can be deleted.
+        with suppress(Exception):
+            await task
+        raise
 
 
 def claim(table, limit: int) -> list[int]:
@@ -184,10 +197,10 @@ def preparation_inputs(batch_id):
 
 def save_preparation(batch_id, checkpoint, *, done=False):
     with SessionLocal.begin() as db:
-        preparation = db.get(SurveyBatchPreparation, batch_id)
-        preparation.checkpoint = checkpoint
-        if done:
-            preparation.state = "done"
+        values = {"checkpoint": checkpoint, **({"state": "done"} if done else {})}
+        changed = db.execute(update(SurveyBatchPreparation).where(
+            SurveyBatchPreparation.id == batch_id, SurveyBatchPreparation.state == "running").values(**values))
+        if done and changed.rowcount:
             db.execute(update(SurveyReport).where(SurveyReport.batch_id == batch_id, SurveyReport.state == "waiting")
                        .values(state="queued"))
 
@@ -202,7 +215,7 @@ def calculate_batch_indicators(project_id, dataset_id, batch_id, sources, rules)
 
 async def process_preparation(batch_id):
     (project_id, dataset_id, levels, sources, questions, questionnaire_ids,
-     materials, originals, config, checkpoint) = await asyncio.to_thread(preparation_inputs, batch_id)
+     materials, originals, config, checkpoint) = await job_thread(preparation_inputs, batch_id)
     if originals and "originals_checked" not in checkpoint:
         checked = dict(checkpoint.get("originals", {}))
         issues = list(checkpoint.get("original_issues", []))
@@ -217,9 +230,9 @@ async def process_preparation(batch_id):
             issues.extend(problems)
             complete.append(material["asset_id"])
             checkpoint = {**checkpoint, "originals": checked, "original_issues": issues, "originals_complete": complete}
-            await asyncio.to_thread(save_preparation, batch_id, checkpoint)
+            await job_thread(save_preparation, batch_id, checkpoint)
         checkpoint = {**checkpoint, "originals_checked": True, "stage": "解析年度指标"}
-        await asyncio.to_thread(save_preparation, batch_id, checkpoint)
+        await job_thread(save_preparation, batch_id, checkpoint)
     if "rules" not in checkpoint:
         if checkpoint.get("originals"):
             rules, missing = await parse_indicators(config, materials, questions, questionnaire_ids,
@@ -227,11 +240,11 @@ async def process_preparation(batch_id):
         else:
             rules, missing = await parse_indicators(config, materials, questions, questionnaire_ids)
         checkpoint = {**checkpoint, "stage": "统计年度指标", "rules": rules, "missing": missing}
-        await asyncio.to_thread(save_preparation, batch_id, checkpoint)
+        await job_thread(save_preparation, batch_id, checkpoint)
     if not checkpoint.get("calculated"):
-        await asyncio.to_thread(calculate_batch_indicators, project_id, dataset_id, batch_id, sources, checkpoint["rules"])
+        await job_thread(calculate_batch_indicators, project_id, dataset_id, batch_id, sources, checkpoint["rules"])
         checkpoint = {**checkpoint, "stage": "生成四级框架", "calculated": True}
-        await asyncio.to_thread(save_preparation, batch_id, checkpoint)
+        await job_thread(save_preparation, batch_id, checkpoint)
     outlines = dict(checkpoint.get("outlines", {}))
     notices = dict(checkpoint.get("notices", {}))
     for level in levels:
@@ -241,8 +254,8 @@ async def process_preparation(batch_id):
         names = {item["name"] for item in checkpoint["rules"] + checkpoint["missing"]}
         outlines[level], notices[level] = await make_outline(config, level, names, taken)
         checkpoint = {**checkpoint, "outlines": dict(outlines), "notices": dict(notices)}
-        await asyncio.to_thread(save_preparation, batch_id, checkpoint)
-    await asyncio.to_thread(save_preparation, batch_id, {**checkpoint, "stage": "生成报告"}, done=True)
+        await job_thread(save_preparation, batch_id, checkpoint)
+    await job_thread(save_preparation, batch_id, {**checkpoint, "stage": "生成报告"}, done=True)
 
 
 def jurisdiction_coverage(index, org_id, questionnaires):
@@ -370,15 +383,20 @@ async def interpretation(config, surveys):
     raise ValueError("AI 解读未通过格式检查")
 
 
+def finish_report(report_id, files, notice=""):
+    with SessionLocal.begin() as db:
+        changed = db.execute(update(SurveyReport).where(
+            SurveyReport.id == report_id, SurveyReport.state == "running").values(state="done", notice=notice))
+        if changed.rowcount:
+            for temporary, final in files:
+                temporary.replace(final)
+
+
 def publish_report(path, report_id, options, notice=""):
     temp = path.with_name(f"{path.stem}.working.docx")
     try:
         build_word(temp, **options)
-        temp.replace(path)
-        with SessionLocal.begin() as db:
-            row = db.get(SurveyReport, report_id)
-            row.state = "done"
-            row.notice = notice
+        finish_report(report_id, [(temp, path)], notice)
     finally:
         temp.unlink(missing_ok=True)
 
@@ -429,13 +447,10 @@ def publish_modern(path, red_path, report_id, document, checkpoint, notice):
                         raise
                     document = {**document, "template": None}
                     notice = "；".join(filter(None, [notice, "Word 版式校验失败，已使用本级内置版式"]))
-        temp.replace(path)
-        red_temp.replace(red_path)
-        with SessionLocal.begin() as db:
-            row = db.get(SurveyReport, report_id)
-            row.state = "done"
-            row.notice = (notice + (f"；{len(document['missing']) + sum(bool(i['reason']) for i in document['annual'])} 项指标缺项"
-                                    if document["missing"] or any(i["reason"] for i in document["annual"]) else "")).strip("；")[:255]
+        missing = len(document["missing"]) + sum(bool(item["reason"]) for item in document["annual"])
+        if missing:
+            notice = "；".join(filter(None, (notice, f"{missing} 项指标缺项")))
+        finish_report(report_id, [(temp, path), (red_temp, red_path)], notice[:255])
     finally:
         temp.unlink(missing_ok=True)
         red_temp.unlink(missing_ok=True)
@@ -470,7 +485,7 @@ async def process_modern_report(report_id, options, config, path, modern):
             checkpoint["analysis"] = default_draft(facts, level, red=True)
             notices.append("红字解析采用本地证据生成")
         checkpoint["notices"] = notices
-        await asyncio.to_thread(save_report_checkpoint, report_id, checkpoint)
+        await job_thread(save_report_checkpoint, report_id, checkpoint)
     if "body" not in checkpoint:
         try:
             checkpoint["body"] = await write_sections(config, **write_args, red=False, analysis=checkpoint["analysis"])
@@ -479,7 +494,7 @@ async def process_modern_report(report_id, options, config, path, modern):
             checkpoint["approved"] = checkpoint["body"]
             notices.append("正文采用本地统计与措辞")
         checkpoint["notices"] = notices
-        await asyncio.to_thread(save_report_checkpoint, report_id, checkpoint)
+        await job_thread(save_report_checkpoint, report_id, checkpoint)
     if "approved" not in checkpoint:
         review_args = {"level": level, "outline": outline, "facts": facts, "missing": report_missing}
         if modern["originals"]:
@@ -498,15 +513,24 @@ async def process_modern_report(report_id, options, config, path, modern):
             checkpoint["approved"] = default_draft(facts, level, red=False)
             notices.append("正文审核后采用本地统计与措辞")
         checkpoint["notices"] = notices
-        await asyncio.to_thread(save_report_checkpoint, report_id, checkpoint)
+        await job_thread(save_report_checkpoint, report_id, checkpoint)
     notice = "；".join(filter(None, [modern["notice"], *notices]))
     document = {**options, "outline": outline, "facts": facts, "annual": modern["annual"], "missing": missing,
                 "annual_mode": modern["annual_mode"], "show_question_chart": not modern["annual_mode"]}
-    await asyncio.to_thread(publish_modern, path, modern["analysis_path"], report_id, document, checkpoint, notice)
+    await job_thread(publish_modern, path, modern["analysis_path"], report_id, document, checkpoint, notice)
+
+
+def publish_structured(path, report_id, options, draft, facts):
+    temp = path.with_suffix(".working")
+    try:
+        render_word(temp, **options, outline=[], draft=draft, facts=facts, annual=[], missing=[])
+        finish_report(report_id, [(temp, path)])
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 async def process_report(report_id: int):
-    options = await asyncio.to_thread(prepare_report, report_id)
+    options = await job_thread(prepare_report, report_id)
     config = options.pop("config")
     include_ai = options.pop("include_ai")
     path = options.pop("path")
@@ -517,15 +541,7 @@ async def process_report(report_id: int):
     if options["template"] and options["template"][1].get("structured"):
         facts = facts_for(options["surveys"], False, [], [], [])
         draft = default_draft(facts, options["level"], red=False)
-        temp = path.with_suffix(".working")
-        try:
-            await asyncio.to_thread(render_word, temp, **options, outline=[], draft=draft,
-                                    facts=facts, annual=[], missing=[])
-            temp.replace(path)
-            with SessionLocal.begin() as db:
-                db.get(SurveyReport, report_id).state = "done"
-        finally:
-            temp.unlink(missing_ok=True)
+        await job_thread(publish_structured, path, report_id, options, draft, facts)
         return
     notice = ""
     if include_ai:
@@ -537,14 +553,13 @@ async def process_report(report_id: int):
                 notice = "AI 解读未通过检查，已生成完整统计报告"
         else:
             notice = "暂无可用写作模型，已生成完整统计报告"
-    await asyncio.to_thread(publish_report, path, report_id, options, notice)
+    await job_thread(publish_report, path, report_id, options, notice)
 
 
 def fail(table, id_, err):
     with SessionLocal.begin() as db:
-        row = db.get(table, id_)
-        row.state = "failed"
-        row.error = (str(err)[:900] if isinstance(err, ValueError) else f"{type(err).__name__}，请重试")
+        error = str(err)[:900] if isinstance(err, ValueError) else f"{type(err).__name__}，请重试"
+        db.execute(update(table).where(table.id == id_, table.state == "running").values(state="failed", error=error))
 
 
 async def run_job(table, id_):
@@ -566,13 +581,23 @@ async def run_job(table, id_):
                 await asyncio.sleep(attempt + 1)
                 continue
             logger.error("Survey job %s/%d failed: %s", table.__tablename__, id_, type(exc).__name__)
-            await asyncio.to_thread(fail, table, id_, exc)
+            await job_thread(fail, table, id_, exc)
             return
+
+
+def stopping_jobs(table, ids):
+    with SessionLocal() as db:
+        return list(db.scalars(select(table.id).where(table.id.in_(ids), table.state == "stopping")))
+
+
+def finalize_stops(table, ids):
+    with SessionLocal.begin() as db:
+        db.execute(update(table).where(table.id.in_(ids), table.state == "stopping").values(state="stopped"))
 
 
 async def worker():
     token = model_slots.set(asyncio.Semaphore(3))
-    jobs = {SurveyDataset: set(), SurveyTemplateParse: set(), SurveyBatchPreparation: set(), SurveyReport: set()}
+    jobs = {SurveyDataset: {}, SurveyTemplateParse: {}, SurveyBatchPreparation: {}, SurveyReport: {}}
     limits = {SurveyDataset: 1, SurveyTemplateParse: 1, SurveyBatchPreparation: 1,
               SurveyReport: max(1, min(8, settings.SURVEY_REPORT_WORKERS))}
     next_cleanup = 0
@@ -582,24 +607,35 @@ async def worker():
                 await asyncio.to_thread(recover_deleted_projects)
                 next_cleanup = monotonic() + 30
             for table, active in jobs.items():
-                for task in tuple(active):
-                    if task.done():
-                        active.remove(task)
+                stoppable = table in (SurveyBatchPreparation, SurveyReport)
+                finished = [id_ for id_, task in active.items() if task.done()]
+                if stoppable and finished:
+                    await asyncio.to_thread(finalize_stops, table, finished)
+                for id_ in finished:
+                    task = active.pop(id_)
+                    if not task.cancelled():
                         try:
                             task.result()
                         except Exception:
                             logger.exception("Could not record survey job result")
+                if stoppable and active:
+                    for id_ in await asyncio.to_thread(stopping_jobs, table, [id_ for id_, task in active.items()
+                                                                           if not task.cancelling()]):
+                        active[id_].cancel()
                 slots = limits[table] - len(active)
                 if slots:
                     ids = await asyncio.to_thread(claim, table, slots)
-                    active.update(asyncio.create_task(run_job(table, id_)) for id_ in ids)
-            running = set().union(*jobs.values())
+                    active.update((id_, asyncio.create_task(run_job(table, id_))) for id_ in ids)
+            running = {task for active in jobs.values() for task in active.values()}
             if running:
                 await asyncio.wait(running, timeout=0.75, return_when=asyncio.FIRST_COMPLETED)
             else:
                 await asyncio.sleep(0.75)
     finally:
         # Leave unfinished rows running so the next startup can requeue them.
-        for task in set().union(*jobs.values()):
-            task.cancel()
+        tasks = [task for active in jobs.values() for task in active.values()]
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         model_slots.reset(token)

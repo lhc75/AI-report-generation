@@ -35,8 +35,8 @@ from ..survey_reports import (WORD_TYPE, BatchSettings, IndicatorRule, check_rul
                               question_options, safe_filename, scope_catalog, template_preview)
 from ..survey_references import REFERENCE_EXTENSIONS, linked_questionnaire, reference_excerpt
 from ..survey_schools import read_roster, roster_template, school_path
-from ..survey_storage import (ACTIVE, active_batch, active_import, lock_project, project_dir,
-                               purge_archived_inputs, purge_project, remove_project_records)
+from ..survey_storage import (ACTIVE, BATCH_ACTIVE, active_batch, active_import, lock_project, project_dir,
+                               purge_archived_inputs, purge_batch, purge_project, remove_project_records)
 from ..survey_worker import analysis_path, index_path, model_for, report_path
 
 router = APIRouter(prefix="/api/surveys", tags=["survey"])
@@ -91,7 +91,7 @@ def owned(db, project_id, user, *, write=False):
 
 def belongs(db, model, item_id, project_id):
     row = db.get(model, item_id)
-    if row is None or row.project_id != project_id:
+    if row is None or row.project_id != project_id or (model is SurveyBatch and row.deleted):
         raise HTTPException(404, "记录不存在")
     return row
 
@@ -491,7 +491,8 @@ def report_status(project_id: int, dataset_id: int, user: User = Depends(get_cur
 
     reports = db.execute(select(SurveyBatch.dataset_id, SurveyReport.org_id, SurveyReport.org_level,
                                 SurveyReport.org_path).join(SurveyReport, SurveyReport.batch_id == SurveyBatch.id)
-                         .where(SurveyBatch.project_id == project_id, SurveyReport.state == "done").distinct())
+                         .where(SurveyBatch.project_id == project_id, SurveyBatch.deleted.is_(False),
+                                SurveyReport.state == "done").distinct())
     current = set()
     historical = set()
     historical_schools = {}
@@ -664,6 +665,8 @@ def save_batch(db, project_id, data):
     request_id = str(data.request_id)
     request_lookup = select(SurveyBatch).where(SurveyBatch.project_id == project_id, SurveyBatch.request_id == request_id)
     if existing := db.scalar(request_lookup):
+        if existing.deleted:
+            raise HTTPException(409, "该批次已删除，请重新预览出报清单")
         return {"id": existing.id}
     summary, jobs = plan(db, project_id, data)
     if not jobs:
@@ -719,14 +722,14 @@ def batch_summary(db, batch):
                       "notices": preparation.checkpoint.get("notices", {})}
     counts["queued"] = counts.get("queued", 0) + counts.pop("waiting", 0)
     return {"id": batch.id, "dataset_id": batch.dataset_id, "created_at": batch.created_at,
-            "counts": {state: counts.get(state, 0) for state in ("queued", "running", "done", "failed")},
+            "counts": {state: counts.get(state, 0) for state in ("queued", "running", "done", "failed", "stopping", "stopped")},
             "total": sum(counts.values()), "levels": batch.config["levels"], "generation": generation}
 
 
 @router.get("/{project_id}/batches")
 def list_batches(project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     owned(db, project_id, user)
-    batches = db.scalars(select(SurveyBatch).where(SurveyBatch.project_id == project_id)
+    batches = db.scalars(select(SurveyBatch).where(SurveyBatch.project_id == project_id, SurveyBatch.deleted.is_(False))
                          .order_by(SurveyBatch.id.desc()).limit(100))
     return [batch_summary(db, row) for row in batches]
 
@@ -754,6 +757,36 @@ def batch_detail(project_id: int, batch_id: int, state: str | None = None, offse
          "state": "queued" if row.state == "waiting" else row.state, "error": row.error, "notice": row.notice,
          "missing": drafts.get(row.id, {}).get("missing", []),
          "analysis": bool(summary["generation"] and row.state == "done")} for row in rows]}
+
+
+@router.post("/{project_id}/batches/{batch_id}/stop")
+def stop_batch(project_id: int, batch_id: int, user: User = Depends(get_current_user),
+               db: WriteSession = None):
+    owned(db, project_id, user, write=True)
+    belongs(db, SurveyBatch, batch_id, project_id)
+    for model, scope in ((SurveyBatchPreparation, SurveyBatchPreparation.id == batch_id),
+                         (SurveyReport, SurveyReport.batch_id == batch_id)):
+        db.execute(update(model).where(scope, model.state == "running").values(state="stopping", error=""))
+        pending = ("queued", "failed") if model is SurveyBatchPreparation else ("queued", "waiting")
+        db.execute(update(model).where(scope, model.state.in_(pending)).values(state="stopped", error=""))
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/{project_id}/batches/{batch_id}")
+def delete_batch(project_id: int, batch_id: int, user: User = Depends(get_current_user),
+                 db: WriteSession = None):
+    owned(db, project_id, user, write=True)
+    batch = belongs(db, SurveyBatch, batch_id, project_id)
+    preparation = db.get(SurveyBatchPreparation, batch_id)
+    active = db.scalar(select(SurveyReport.id).where(SurveyReport.batch_id == batch_id,
+                                                    SurveyReport.state.in_((*BATCH_ACTIVE, "waiting"))).limit(1))
+    if active is not None or (preparation and preparation.state in BATCH_ACTIVE):
+        raise HTTPException(409, "请先停止批次并等待停止完成")
+    batch.deleted = True
+    db.commit()
+    purge_batch(project_id, batch_id)
+    return {"ok": True}
 
 
 @router.post("/{project_id}/batches/{batch_id}/retry")

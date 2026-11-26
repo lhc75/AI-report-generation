@@ -79,6 +79,7 @@ for _table, _column, _type, _default in [
     ("project", "operation_token", "VARCHAR(36)", "''"),
     ("project", "auto_report", "INTEGER", "0"),
     ("survey_report", "notice", "VARCHAR(255)", "''"),
+    ("survey_batch", "deleted", "INTEGER", "0"),
     ("survey_project", "deleted", "INTEGER", "0"),
     ("survey_asset", "archived", "INTEGER", "0"),
     ("survey_dataset", "archived", "INTEGER", "0"),

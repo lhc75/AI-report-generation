@@ -73,6 +73,7 @@ class SurveyBatch(Base):
     request_id: Mapped[str] = mapped_column(String(36))
     config: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    deleted: Mapped[bool] = mapped_column(default=False)
     __table_args__ = (UniqueConstraint("project_id", "request_id"),)
 
 

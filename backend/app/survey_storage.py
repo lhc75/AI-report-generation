@@ -14,6 +14,7 @@ from .survey_models import (SurveyAnalysisPhrase, SurveyAsset, SurveyBatch, Surv
 
 logger = logging.getLogger(__name__)
 ACTIVE = ("queued", "running")
+BATCH_ACTIVE = (*ACTIVE, "stopping")
 
 
 def project_dir(project_id: int, *, create: bool = True) -> Path:
@@ -45,7 +46,7 @@ def active_batch(db, project_id):
     for model in (SurveyBatchPreparation, SurveyReport):
         relation = model.id if model is SurveyBatchPreparation else model.batch_id
         row = db.execute(select(SurveyBatch.id, model.state).join(model, relation == SurveyBatch.id)
-                         .where(SurveyBatch.project_id == project_id, model.state.in_(ACTIVE)).limit(1)).first()
+                         .where(SurveyBatch.project_id == project_id, model.state.in_(BATCH_ACTIVE)).limit(1)).first()
         if row:
             return row
     return None
@@ -126,8 +127,35 @@ def unlink_input(path):
     return True
 
 
+def purge_batch(project_id, batch_id):
+    with SessionLocal.begin() as db:
+        if lock_project(db, project_id) is None:
+            return
+        batch = db.get(SurveyBatch, batch_id)
+        if not batch or batch.project_id != project_id or not batch.deleted:
+            return
+        root = project_dir(project_id, create=False)
+        report_ids = select(SurveyReport.id).where(SurveyReport.batch_id == batch_id)
+        paths = [root / f"indicators-{batch_id}{suffix}" for suffix in (".sqlite", ".working.sqlite")]
+        for report_id in db.scalars(report_ids):
+            paths.extend(root / f"{kind}-{report_id}{suffix}" for kind in ("report", "analysis")
+                         for suffix in (".docx", ".working.docx", ".working"))
+        cleaned = [unlink_input(path) for path in paths]
+        if not all(cleaned):
+            return
+        db.execute(delete(SurveyAnalysisPhrase).where(SurveyAnalysisPhrase.batch_id == batch_id))
+        db.execute(delete(SurveyReportDraft).where(SurveyReportDraft.id.in_(report_ids)))
+        db.execute(delete(SurveyReport).where(SurveyReport.batch_id == batch_id))
+        db.execute(delete(SurveyBatchPreparation).where(SurveyBatchPreparation.id == batch_id))
+        db.delete(batch)
+    purge_archived_inputs(project_id)
+
+
 def recover_deleted_projects():
     with SessionLocal() as db:
         project_ids = list(db.scalars(select(SurveyProject.id).where(SurveyProject.deleted.is_(True))))
+        batches = list(db.execute(select(SurveyBatch.project_id, SurveyBatch.id).where(SurveyBatch.deleted.is_(True))))
     for project_id in project_ids:
         purge_project(project_id)
+    for project_id, batch_id in batches:
+        purge_batch(project_id, batch_id)

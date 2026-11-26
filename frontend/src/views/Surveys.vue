@@ -392,12 +392,18 @@
             <el-option v-for="row in batches" :key="row.id" :value="row.id" :label="'批次 #' + row.id + ' · ' + row.counts.done + '/' + row.total + ' 已完成'" />
           </el-select>
           <el-button :icon="Refresh" @click="refreshBatches">刷新</el-button>
+          <el-button v-if="batch && (canStopBatch || batchStopping)" :icon="VideoPause" type="warning"
+                     :loading="batchStopping" :disabled="busy" @click="stopBatch">
+            {{ batchStopping ? '正在停止' : '停止批次' }}
+          </el-button>
+          <el-button v-if="batch" :icon="Delete" type="danger" plain :disabled="busy || downloading || canStopBatch || batchStopping"
+                     @click="removeBatch">删除批次</el-button>
         </div>
         <el-empty v-if="!batch" description="暂无出报批次" />
         <template v-else>
           <div v-if="batch.generation && batch.generation.state !== 'done'" class="toolbar" aria-live="polite">
             <el-alert :type="batch.generation.state === 'failed' ? 'error' : 'info'" :closable="false"
-                      :title="batch.generation.error || batch.generation.stage" />
+                      :title="batchPreparationTitle" />
             <el-button v-if="batch.generation.state === 'failed'" @click="retryBatch">继续处理</el-button>
           </div>
           <el-collapse v-if="batch.generation?.missing.length">
@@ -417,9 +423,11 @@
               </el-table>
             </el-collapse-item>
           </el-collapse>
-          <el-progress :percentage="Math.floor(100 * (batch.counts.done + batch.counts.failed) / batch.total)" />
+          <el-progress :percentage="Math.floor(100 * (batch.counts.done + batch.counts.failed + batch.counts.stopped) / batch.total)" />
           <div class="toolbar spaced">
             <el-text>已完成 {{ batch.counts.done }} · 运行中 {{ batch.counts.running }} · 排队 {{ batch.counts.queued }} · 失败 {{ batch.counts.failed }}</el-text>
+            <el-text v-if="batch.counts.stopping">正在停止 {{ batch.counts.stopping }}</el-text>
+            <el-text v-if="batch.counts.stopped">已停止 {{ batch.counts.stopped }}</el-text>
           </div>
           <div class="toolbar">
             <el-select v-model="zipLevel" clearable placeholder="ZIP 全部层级" class="medium-select"><el-option v-for="[value, label] in levels" :key="value" :value="value" :label="label" /></el-select>
@@ -463,7 +471,7 @@
 <script setup>
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, Delete, Download, Plus, Refresh, Search, Upload } from '@element-plus/icons-vue'
+import { ArrowLeft, Delete, Download, Plus, Refresh, Search, Upload, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api'
 import { inJurisdiction, levels, toggleOrganizations } from '../surveySelection'
@@ -473,7 +481,7 @@ const router = useRouter()
 const id = computed(() => Number(route.params.id) || null)
 const endpoint = computed(() => '/surveys' + (id.value ? '/' + id.value : ''))
 const levelNames = Object.fromEntries(levels)
-const states = { queued: '排队', running: '运行中', done: '已完成', failed: '失败' }
+const states = { queued: '排队', running: '运行中', done: '已完成', failed: '失败', stopping: '正在停止', stopped: '已停止' }
 const schoolStages = { primary: '小学', middle: '初中', unknown: '学段未匹配' }
 const mappingFields = [['city', '市州'], ['county', '区县'], ['school', '学校名称'], ['school_id', '学校 ID'], ['questionnaire', '问卷类型']]
 const methods = [['count', '计数'], ['rate', '比例'], ['multiple_rate', '多选勾选率'], ['mean', '均值']]
@@ -580,6 +588,14 @@ const previewPageRows = computed(() => filteredPreview.value.slice((previewPage.
 const batches = ref([])
 const batchId = ref(null)
 const batch = ref(null)
+const canStopBatch = computed(() => Boolean(batch.value?.counts.queued || batch.value?.counts.running))
+const batchStopping = computed(() => Boolean(batch.value?.counts.stopping || batch.value?.generation?.state === 'stopping'))
+const batchPreparationTitle = computed(() => {
+  const generation = batch.value?.generation
+  if (!generation) return ''
+  if (generation.state === 'stopping' || generation.state === 'stopped') return states[generation.state]
+  return generation.error || generation.stage
+})
 const batchJurisdictions = ref([])
 const reportState = ref('')
 const reportPage = ref(1)
@@ -1054,8 +1070,32 @@ async function refreshBatches() {
   const { data } = await api.get('/surveys/' + current + '/batches')
   if (id.value !== current) return
   batches.value = data
-  if (!batchId.value) batchId.value = data[0]?.id || null
-  else await loadBatch()
+  if (data.some(row => row.id === batchId.value)) await loadBatch()
+  else batchId.value = data[0]?.id || null
+}
+
+async function stopBatch() {
+  const row = batch.value
+  if (!row || row.id !== batchId.value) return
+  await withBusy(async () => {
+    await api.post(endpoint.value + '/batches/' + row.id + '/stop')
+    await loadBatch()
+  })
+}
+
+async function removeBatch() {
+  const row = batch.value
+  const activeProject = id.value
+  if (!row || row.id !== batchId.value) return
+  if (!await confirmDelete(`确定删除批次 #${row.id}？批次记录和项目内的 Word、红字解析会一并删除，不可恢复。`, '删除批次')) return
+  if (id.value !== activeProject || batchId.value !== row.id) return
+  await withBusy(async () => {
+    await api.delete(endpoint.value + '/batches/' + row.id)
+    if (id.value !== activeProject) return
+    if (batchId.value === row.id) batchId.value = null
+    await Promise.all([refreshBatches(), loadReportStatus()])
+    ElMessage.success('已删除批次')
+  })
 }
 
 async function retry(row) {
@@ -1161,6 +1201,9 @@ watch([tab, () => project.value?.dataset_id], ([activeTab, datasetId], [, previo
   }
 })
 watch(batchId, () => {
+  batch.value = null
+  batchJurisdictions.value = []
+  reportState.value = ''
   reportPage.value = 1
   zipOrg.value = null
   zipPart.value = 1
@@ -1176,8 +1219,8 @@ const timer = setInterval(async () => {
   try {
     if (importing.value || templates.value.some(templateParsing)) await loadProject()
     if (tab.value === 'plan' && Date.now() - reportStatusCheckedAt >= 5000) await loadReportStatus()
-    if (tab.value === 'batches' && batch.value?.generation?.state !== 'failed'
-        && (batch.value?.counts.queued || batch.value?.counts.running)) await refreshBatches()
+    if (tab.value === 'batches' && (batchStopping.value ||
+        (batch.value?.generation?.state !== 'failed' && canStopBatch.value))) await refreshBatches()
   } catch { /* error handled by API interceptor */ }
   finally { polling = false }
 }, 2500)

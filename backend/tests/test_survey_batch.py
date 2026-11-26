@@ -410,6 +410,81 @@ def test_deletion_conflicts_with_running_import_and_report(client, monkeypatch):
     assert http.delete(base).is_success
 
 
+def test_stop_preparation_cancels_model_wait_and_allows_batch_deletion(client, monkeypatch):
+    http, other = client
+    base, dataset_id, _ = prepare(http, SMALL)
+    entered, cancelled = Event(), Event()
+
+    async def blocked_outline(*args):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(survey_worker, "make_outline", blocked_outline)
+    request = {"dataset_id": dataset_id, "request_id": str(uuid4()), "mode": "all"}
+    batch_id = successful(http.post(base + "/generate", json=request))["id"]
+    url = f"{base}/batches/{batch_id}"
+    assert entered.wait(5)
+    assert http.delete(url).status_code == 409
+    assert http.post(url + "/stop", headers=other).status_code == 404
+    assert http.delete(url, headers=other).status_code == 404
+    assert http.post(url + "/stop").is_success
+    assert cancelled.wait(5)
+    batch = await_state(http, url, lambda row: row["generation"]["state"] == "stopped")
+    assert batch["counts"]["stopped"] == batch["total"]
+    assert http.post(url + "/retry").status_code == 409
+    assert http.post(url + "/stop").is_success
+    assert http.delete(url).is_success
+    assert http.get(url).status_code == 404
+    assert successful(http.get(base + "/batches")) == []
+    assert successful(http.get(base))["dataset_id"] == dataset_id
+
+
+def test_stop_during_word_render_waits_for_file_cleanup(client, monkeypatch, tmp_path):
+    http, _ = client
+    base, dataset_id, _ = prepare(http, SMALL)
+    request = {"dataset_id": dataset_id, "request_id": str(uuid4())}
+    completed_id = successful(http.post(base + "/batches", json=request))["id"]
+    completed_url = f"{base}/batches/{completed_id}"
+    completed = await_state(http, completed_url, lambda row: row["counts"]["done"] == 1)
+    completed_download = f"{completed_url}/reports/{completed['reports'][0]['id']}/download"
+
+    entered, release = Event(), Event()
+    original = survey_worker.build_word
+
+    def blocked_word(*args, **kwargs):
+        original(*args, **kwargs)
+        entered.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(survey_worker, "build_word", blocked_word)
+    request["request_id"] = str(uuid4())
+    batch_id = successful(http.post(base + "/batches", json=request))["id"]
+    url = f"{base}/batches/{batch_id}"
+    try:
+        assert entered.wait(5)
+        assert http.post(url + "/stop").is_success
+        assert http.delete(url).status_code == 409
+        assert successful(http.get(url))["counts"]["stopping"] == 1
+    finally:
+        release.set()
+    stopped = await_state(http, url, lambda row: row["counts"]["stopped"] == 1)
+    report_id = stopped["reports"][0]["id"]
+    assert http.get(f"{url}/reports/{report_id}/download").status_code == 404
+    assert http.delete(url).is_success
+    assert not list(tmp_path.glob(f"*/report-{report_id}.*"))
+    assert http.get(completed_download).is_success
+
+    status_url = f"{base}/report-status?dataset_id={dataset_id}"
+    assert successful(http.get(status_url))["current_org_ids"]
+    assert http.delete(completed_url).is_success
+    assert successful(http.get(status_url))["current_org_ids"] == []
+    assert http.get(completed_download).status_code == 404
+    assert not list(tmp_path.glob("*/report-*.docx"))
+
+
 def test_report_status_matches_across_imports_and_allows_regeneration(client, monkeypatch):
     http, other = client
     base, first_version, first_catalog = prepare(http, [*SMALL, (*SMALL[0][:4], *SMALL[2][4:])])
@@ -650,7 +725,7 @@ def test_generate_thousand_documents_and_fixed_zip_parts(client):
                                                           "request_id": str(uuid4())}))
     url = base + "/batches/" + str(created["id"])
     status = await_state(http, url, lambda row: not (row["counts"]["queued"] + row["counts"]["running"]), timeout=150)
-    assert status["counts"] == {"queued": 0, "running": 0, "done": 1013, "failed": 0}
+    assert status["counts"] == {"queued": 0, "running": 0, "done": 1013, "failed": 0, "stopping": 0, "stopped": 0}
     names = set()
     for part in range(1, 12):
         response = http.get(url + "/zip", params={"level": "school", "part": part})
@@ -924,7 +999,7 @@ def test_one_click_annual_rules_fixed_outlines_and_resumable_documents(client, d
     url = base + "/batches/" + str(created["id"])
     batch = await_state(http, url, lambda row: row["generation"]["state"] == "failed"
                         or row["counts"]["failed"] > 0 or row["counts"]["done"] == 8)
-    assert batch["counts"] == {"queued": 0, "running": 0, "done": 8, "failed": 0}, batch
+    assert batch["counts"] == {"queued": 0, "running": 0, "done": 8, "failed": 0, "stopping": 0, "stopped": 0}, batch
     assert len(corrections) == 2 and "筛选选项" in corrections[1]
     assert batch["generation"]["missing"][0]["reason"] == "答卷中缺少培训学时题"
     assert stage_calls["outline"] == 4 and stage_calls["approved"] == 9 and stage_calls["red"] > 8
@@ -1012,7 +1087,7 @@ def test_one_click_two_thousand_word_reports_with_bounded_model_concurrency(clie
     url = base + "/batches/" + str(created["id"])
     status = await_state(http, url, lambda row: row["counts"]["done"] + row["counts"]["failed"] == 2003,
                          timeout=360)
-    assert status["counts"] == {"queued": 0, "running": 0, "done": 2003, "failed": 0}
+    assert status["counts"] == {"queued": 0, "running": 0, "done": 2003, "failed": 0, "stopping": 0, "stopped": 0}
     assert 1 < peak <= 3 and calls >= 6009
     archived = http.get(url + "/zip", params={"level": "school", "part": 20})
     assert archived.is_success
