@@ -214,7 +214,7 @@ def report_data(db, org_id: int, questionnaire_ids: list[int], rules: list[dict]
             question = questions.get(rule["question_id"])
             if question:
                 indicators.append(calculate_indicator(rule, question, sample[0] if sample else 0))
-        result.append({"name": survey[0], "sample": sample[0] if sample else 0,
+        result.append({"id": questionnaire_id, "name": survey[0], "sample": sample[0] if sample else 0,
                        "questions": list(questions.values()), "indicators": indicators})
     return result
 

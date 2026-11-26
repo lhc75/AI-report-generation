@@ -10,7 +10,7 @@ from .config import settings
 from .db import SessionLocal
 from .survey_models import (SurveyAnalysisPhrase, SurveyAsset, SurveyBatch, SurveyBatchPreparation,
                             SurveyDataset, SurveyIndicatorVersion, SurveyProject, SurveyReport,
-                            SurveyReportDraft)
+                            SurveyReportDraft, SurveyTemplateParse)
 
 logger = logging.getLogger(__name__)
 ACTIVE = ("queued", "running")
@@ -55,6 +55,8 @@ def remove_project_records(db, project):
     batch_ids = select(SurveyBatch.id).where(SurveyBatch.project_id == project.id)
     report_ids = select(SurveyReport.id).where(SurveyReport.batch_id.in_(batch_ids))
     for model, condition in (
+        (SurveyTemplateParse, SurveyTemplateParse.id.in_(
+            select(SurveyAsset.id).where(SurveyAsset.project_id == project.id))),
         (SurveyAnalysisPhrase, SurveyAnalysisPhrase.batch_id.in_(batch_ids)),
         (SurveyReportDraft, SurveyReportDraft.id.in_(report_ids)),
         (SurveyReport, SurveyReport.batch_id.in_(batch_ids)),
@@ -109,7 +111,8 @@ def purge_archived_inputs(project_id):
         live_paths = {asset.path for asset in assets if not asset.archived or asset.id in references}
         for asset in assets:
             if asset.archived and asset.id not in references:
-                if not asset.path or asset.path in live_paths or unlink_input(root / asset.path):
+                parsed = root / f"template-{asset.id}-parsed.docx"
+                if unlink_input(parsed) and (not asset.path or asset.path in live_paths or unlink_input(root / asset.path)):
                     asset.path = ""
                     asset.details = {}
 

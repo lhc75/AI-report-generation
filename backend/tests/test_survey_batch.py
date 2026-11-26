@@ -11,7 +11,9 @@ from zipfile import ZipFile
 import pytest
 import xlwt
 from docx import Document
+from docx.enum.section import WD_SECTION
 from docx.oxml.ns import qn
+from docx.shared import RGBColor
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 from pypdf import PdfWriter
@@ -25,6 +27,7 @@ from app.models import ModelConfig, User
 from app.security import create_token
 from app.survey_models import SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyProject, SurveyReport, SurveyReportDraft
 from app import survey_ai, survey_authoring, survey_worker
+from app.survey_reports import chart_image
 
 
 def workbook(rows):
@@ -100,6 +103,88 @@ SMALL = [
     ("乙学校", "12", "甲市", "同名区", "教师", "满意", "图书", 40),
     ("同名学校", "21", "乙市", "同名区", "学生", "不满意", "图书；讲座", 60),
 ]
+
+
+def test_complete_word_report_parsing_versions_and_download(client, db):
+    http, other = client
+    base, dataset_id, _ = prepare(http, SMALL)
+    example = Document()
+    example.sections[0].header.paragraphs[0].text = "监测页眉"
+    example.add_paragraph("原报告封面", "Title")
+    example.add_paragraph("原属地", "Subtitle")
+    example.add_heading("答卷范围", 1)
+    example.add_paragraph("示例答卷有 999999 份")
+    example.add_table(1, 1).cell(0, 0).text = "示例统计表"
+    example.add_section(WD_SECTION.NEW_PAGE)
+    example.add_heading("监测发现", 1)
+    example.add_heading("统计观察", 2)
+    example.add_paragraph("旧报告正文")
+    example.add_picture(chart_image([("旧选项", 999)], 1000))
+    example.add_paragraph().add_run("【生成表格】按有效答卷汇总").font.color.rgb = RGBColor.from_string("FF0000")
+    buffer = io.BytesIO()
+    example.save(buffer)
+    raw = buffer.getvalue()
+    form = {"kind": "template", "level": "province", "parse_report": "true"}
+    row = successful(http.post(base + "/assets", data=form, files={"file": ("完整报告.docx", raw)}))
+    template_id = row["id"]
+    assert row["parse_state"] == "queued"
+
+    def parsed(asset_id, state="done"):
+        project = await_state(http, base, lambda data: any(asset["id"] == asset_id and
+                              asset.get("parse_state") in {"done", "failed"} for asset in data["assets"]))
+        asset = next(asset for asset in project["assets"] if asset["id"] == asset_id)
+        assert asset["parse_state"] == state, asset
+        return asset
+
+    result = parsed(template_id)
+    assert result["ready"]
+    assert [section["path"] for section in result["sections"]] == [["答卷范围"], ["监测发现"], ["监测发现", "统计观察"]]
+    assert [m["kind"] for m in result["sections"][-1]["modules"]] == ["text", "image", "table"]
+    assert result["sections"][-1]["modules"][-1]["instruction"] == "【生成表格】按有效答卷汇总"
+    file_url = f"{base}/templates/{template_id}/file"
+    assert http.get(file_url).content == raw
+    assert http.get(file_url, headers=other).status_code == 404
+    red = http.get(file_url, params={"parsed": True})
+    assert red.is_success
+    red_doc = Document(io.BytesIO(red.content))
+    assert len(red_doc.sections) == 2
+    assert not red_doc.tables and not red_doc.inline_shapes
+    assert all("999999" not in p.text for p in red_doc.paragraphs)
+    assert any(p.text == "【生成表格】按有效答卷汇总" for p in red_doc.paragraphs)
+
+    invalid = successful(http.post(base + "/assets", data=form,
+                         files={"file": ("无章节.docx", docx_template("没有章节"))}))
+    failure = parsed(invalid["id"], "failed")
+    assert "未识别到章节" in failure["parse_error"] and not failure["ready"]
+    retry = successful(http.post(f"{base}/templates/{invalid['id']}/parse"))
+    assert retry["id"] == invalid["id"]
+    parsed(invalid["id"], "failed")
+
+    payload = {"dataset_id": dataset_id, "levels": {"province": {"templates": [template_id]}}}
+    preview = successful(http.post(base + "/preview", json=payload))
+    assert preview["organizations"][0]["template_id"] == template_id
+    batch = successful(http.post(base + "/generate", json={**payload, "request_id": str(uuid4())}))
+    batch_url = f"{base}/batches/{batch['id']}"
+    version = successful(http.post(f"{base}/templates/{template_id}/parse"))
+    assert version["id"] != template_id and version["previous_version"] == template_id
+    parsed(version["id"])
+    finished = await_state(http, batch_url, lambda data: data["counts"]["done"] or data["counts"]["failed"])
+    assert finished["counts"]["done"] == 1, finished
+    report = finished["reports"][0]
+    db.expire_all()
+    assert db.get(SurveyReport, report["id"]).template_id == template_id
+    output_url = f"{batch_url}/reports/{report['id']}/download"
+    output = http.get(output_url)
+    assert output.is_success
+    doc = Document(io.BytesIO(output.content))
+    assert len(doc.sections) == 2
+    assert doc.sections[1].header.paragraphs[0].text == "监测页眉"
+    assert [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")] == ["答卷范围", "监测发现", "统计观察"]
+    assert len(doc.tables) == 2 and len(doc.inline_shapes) == 1
+    assert "问卷类型" in doc.tables[0].cell(0, 0).text
+    assert all("999999" not in p.text and p.text not in {"原属地", "旧报告正文", "原报告封面"} for p in doc.paragraphs)
+    assert http.delete(f"{base}/assets/{template_id}").is_success
+    assert http.get(output_url).content == output.content
 
 
 def roster_xlsx(rows):

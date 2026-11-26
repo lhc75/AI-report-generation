@@ -30,7 +30,7 @@ from ..models import User
 from ..survey_data import (ANSWER_EXTENSIONS, Level, SheetMapping, clean, detect_fields, inspect_workbook,
                            open_answer_sheets, open_index)
 from ..survey_models import (SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyIndicatorVersion,
-                             SurveyProject, SurveyReport, SurveyReportDraft)
+                             SurveyProject, SurveyReport, SurveyReportDraft, SurveyTemplateParse)
 from ..survey_reports import (WORD_TYPE, BatchSettings, IndicatorRule, check_rules, preview_reports, question_catalog,
                               question_options, safe_filename, scope_catalog, template_preview)
 from ..survey_references import REFERENCE_EXTENSIONS, linked_questionnaire, reference_excerpt
@@ -124,9 +124,12 @@ def project_values(row):
     return {key: getattr(row, key) for key in ("id", "name", "province", "year", "dataset_id")}
 
 
-def asset_values(row):
+def asset_values(row, parsing=None):
     details = {"counts": row.details["counts"]} if row.kind == "school" else row.details
-    return {"id": row.id, "name": row.name, "kind": row.kind, **details}
+    result = {"id": row.id, "name": row.name, "kind": row.kind, **details}
+    if parsing:
+        result.update(parse_state=parsing.state, parse_error=parsing.error)
+    return result
 
 
 def dataset_values(row):
@@ -160,7 +163,9 @@ def project_detail(project_id: int, user: User = Depends(get_current_user), db: 
     latest = db.scalar(select(SurveyDataset).where(SurveyDataset.project_id == project_id,
                        SurveyDataset.archived.is_(False))
                        .order_by(SurveyDataset.id.desc()).limit(1))
-    files = [asset_values(row) for row in assets]
+    parses = {row.id: row for row in db.scalars(select(SurveyTemplateParse).join(
+        SurveyAsset, SurveyAsset.id == SurveyTemplateParse.id).where(SurveyAsset.project_id == project_id))}
+    files = [asset_values(row, parses.get(row.id)) for row in assets]
     originals = [item for item in files if item["kind"] == "questionnaire"]
     if originals and project.dataset_id:
         with dataset(db, project_id, project.dataset_id) as index:
@@ -179,6 +184,9 @@ def project_detail(project_id: int, user: User = Depends(get_current_user), db: 
 @router.delete("/{project_id}")
 def delete_project(project_id: int, user: User = Depends(get_current_user), db: WriteSession = None):
     project = owned(db, project_id, user, write=True)
+    if db.scalar(select(SurveyTemplateParse.id).join(SurveyAsset).where(
+        SurveyAsset.project_id == project_id, SurveyTemplateParse.state.in_(ACTIVE)).limit(1)):
+        raise HTTPException(409, "Word 报告正在解析，请在完成后删除项目")
     if importing := active_import(db, project_id):
         status = "正在导入" if importing.state == "running" else "正在排队"
         raise HTTPException(409, f"答卷导入版本 #{importing.id} {status}，请在完成后删除项目")
@@ -216,6 +224,7 @@ def save_upload(stream, path):
 
 @router.post("/{project_id}/assets")
 def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level | None = Form(None),
+           parse_report: bool = Form(False),
            user: User = Depends(get_current_user), db: WriteSession = None):
     owned(db, project_id, user, write=True)
     name = file.filename or ""
@@ -251,21 +260,30 @@ def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level |
                                                         SurveyAsset.archived.is_(False))
                               .order_by(SurveyAsset.id.desc()))
         for row in existing:
-            if kind != "template" or row.details["level"] == level:
-                return asset_values(row)
+            if kind != "template" or (row.details["level"] == level and bool(row.details.get("structured")) == parse_report):
+                return asset_values(row, db.get(SurveyTemplateParse, row.id))
         if kind == "data":
             details = {"sheets": inspect_workbook(path, name)}
         elif kind == "template":
-            details = {**template_preview(path), "level": level, "ready": False}
+            details = {"level": level, "ready": False}
+            if parse_report:
+                details.update(structured=True, dataset_id=db.get(SurveyProject, project_id).dataset_id)
+            else:
+                details.update(template_preview(path))
         elif kind == "questionnaire":
             details = {"has_text": bool(reference_excerpt(path))}
         else:
             details = {}
         row = SurveyAsset(project_id=project_id, kind=kind, name=name, path=path.name, digest=digest, details=details)
         db.add(row)
+        parsing = None
+        if kind == "template" and parse_report:
+            db.flush()
+            parsing = SurveyTemplateParse(id=row.id)
+            db.add(parsing)
         db.commit()
         retained = True
-        return asset_values(row)
+        return asset_values(row, parsing)
     except (ValueError, OSError, KeyError) as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
@@ -281,6 +299,9 @@ def delete_asset(project_id: int, asset_id: int, user: User = Depends(get_curren
                  db: WriteSession = None):
     project = owned(db, project_id, user, write=True)
     row = visible_asset(db, project_id, asset_id)
+    parsing = db.get(SurveyTemplateParse, asset_id)
+    if parsing and parsing.state in ACTIVE:
+        raise HTTPException(409, "Word 报告正在解析，请在完成后删除")
     cleared = False
     if row.kind == "data":
         pending = active_import(db, project_id)
@@ -342,6 +363,8 @@ def set_template(project_id: int, asset_id: int, data: TemplateInput, user: User
     row = visible_asset(db, project_id, asset_id)
     if row.kind != "template":
         raise HTTPException(422, "请选择 Word 模板")
+    if row.details.get("structured"):
+        raise HTTPException(422, "完整报告模板由系统解析")
     valid = {item["index"] for item in row.details["paragraphs"]}
     if data.title_index == data.body_index or not {data.title_index, data.body_index} <= valid:
         raise HTTPException(422, "请选择两个不同的标题和正文段落")
@@ -352,6 +375,46 @@ def set_template(project_id: int, asset_id: int, data: TemplateInput, user: User
     row.details = {**row.details, **data.model_dump(), "ready": True}
     db.commit()
     return asset_values(row)
+
+
+@router.post("/{project_id}/templates/{asset_id}/parse")
+def parse_template_again(project_id: int, asset_id: int, user: User = Depends(get_current_user),
+                         db: WriteSession = None):
+    project = owned(db, project_id, user, write=True)
+    row = visible_asset(db, project_id, asset_id)
+    parsing = db.get(SurveyTemplateParse, asset_id)
+    if not parsing:
+        raise HTTPException(422, "请选择从完整报告解析的模板")
+    if parsing.state in ACTIVE:
+        return asset_values(row, parsing)
+    if parsing.state == "done":
+        row = SurveyAsset(project_id=project_id, kind=row.kind, name=row.name, path=row.path, digest=row.digest,
+                          details={"level": row.details["level"], "ready": False, "structured": True,
+                                   "dataset_id": project.dataset_id, "previous_version": row.id})
+        db.add(row)
+        db.flush()
+        parsing = SurveyTemplateParse(id=row.id)
+        db.add(parsing)
+    else:
+        parsing.state = "queued"
+        parsing.error = ""
+        row.details = {**row.details, "dataset_id": project.dataset_id}
+    db.commit()
+    return asset_values(row, parsing)
+
+
+@router.get("/{project_id}/templates/{asset_id}/file")
+def download_template(project_id: int, asset_id: int, parsed: bool = False,
+                      user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    owned(db, project_id, user)
+    row = visible_asset(db, project_id, asset_id)
+    if row.kind != "template" or (parsed and not (row.details.get("structured") and row.details["ready"])):
+        raise HTTPException(404, "Word 文件尚不可下载")
+    path = project_dir(project_id) / (f"template-{asset_id}-parsed.docx" if parsed else row.path)
+    if not path.is_file():
+        raise HTTPException(404, "Word 文件不存在")
+    name = f"{Path(row.name).stem}-红字模板.docx" if parsed else row.name
+    return FileResponse(path, media_type=WORD_TYPE, filename=name, headers={"Cache-Control": "private, no-store"})
 
 
 @router.post("/{project_id}/imports")

@@ -25,11 +25,12 @@ from .survey_authoring import (default_draft, facts_for, make_outline, phrase_di
 from .survey_data import SheetMapping, build_index, open_index
 from .survey_indicators import calculate_results, catalog_for_rules, indicator_values, parse_indicators
 from .survey_models import (SurveyAnalysisPhrase, SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset,
-                            SurveyIndicatorVersion, SurveyProject, SurveyReport, SurveyReportDraft)
-from .survey_references import analyze_original
+                            SurveyIndicatorVersion, SurveyProject, SurveyReport, SurveyReportDraft, SurveyTemplateParse)
+from .survey_references import analyze_original, linked_questionnaire
 from .survey_reports import build_word, report_data
 from .survey_schools import school_path
 from .survey_storage import lock_project, project_dir, recover_deleted_projects
+from .survey_templates import parse_report, save_red_template
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +60,16 @@ def model_for(db, user_id, agent_type):
 
 def recover_interrupted():
     with SessionLocal.begin() as db:
-        for table in (SurveyDataset, SurveyBatchPreparation, SurveyReport):
+        for table in (SurveyDataset, SurveyTemplateParse, SurveyBatchPreparation, SurveyReport):
             db.execute(update(table).where(table.state == "running").values(state="queued", error=""))
 
 
 def claim(table, limit: int) -> list[int]:
     if table is SurveyDataset:
         candidates = select(table.id, table.project_id).where(table.archived.is_(False))
+    elif table is SurveyTemplateParse:
+        candidates = select(table.id, SurveyAsset.project_id).join(SurveyAsset, SurveyAsset.id == table.id).where(
+            SurveyAsset.archived.is_(False))
     else:
         batch_id = table.id if table is SurveyBatchPreparation else table.batch_id
         candidates = select(table.id, SurveyBatch.project_id).join(SurveyBatch, batch_id == SurveyBatch.id)
@@ -103,6 +107,55 @@ def process_import(dataset_id: int):
         project = lock_project(db, project_id)
         db.get(SurveyDataset, dataset_id).state = "done"
         project.dataset_id = dataset_id
+
+
+def process_template(asset_id: int):
+    with SessionLocal() as db:
+        asset = db.get(SurveyAsset, asset_id)
+        project_id, details = asset.project_id, asset.details
+        root = project_dir(project_id)
+        raw = (root / asset.path).read_bytes()
+        questionnaires = []
+        source_index = index_path(project_id, details["dataset_id"]) if details.get("dataset_id") else None
+        if source_index and source_index.is_file():
+            with closing(open_index(source_index)) as index:
+                questionnaires = [dict(row) for row in index.execute("SELECT id,name FROM questionnaire")]
+        originals = list(db.scalars(select(SurveyAsset).where(
+            SurveyAsset.project_id == project_id, SurveyAsset.kind == "questionnaire", SurveyAsset.archived.is_(False))))
+        sources = [(original.name, linked_questionnaire(original.name, original.details, questionnaires))
+                   for original in originals]
+    try:
+        sections = parse_report(raw)
+    except (BadZipFile, PackageNotFoundError, XMLSyntaxError, KeyError) as exc:
+        raise ValueError("Word 文件无法打开，请另存为有效的 .docx 文件") from exc
+    source_names = {match["name"]: name for name, match in sources if match}
+    for section in sections:
+        title = " ".join(section["path"])
+        subjects = [word for word in ("数学", "英语", "科学", "物理") if word in title]
+        roles = [word for word in ("校长", "教师", "学生") if word in title]
+        grades = [word for word in ("六年级", "九年级") if word in title]
+        scoped = bool(subjects or roles or grades)
+        matches = [row["name"] for row in questionnaires if scoped
+            and (not subjects or any(word in row["name"] for word in subjects))
+            and (not roles or any(word in row["name"] for word in roles))
+            and (not grades or any(word in row["name"] for word in grades))
+        ]
+        section["questionnaires"] = matches if scoped and questionnaires else None
+        section["references"] = [source_names[name] for name in matches if name in source_names]
+        if matches:
+            for module in section["modules"]:
+                if module.get("inferred", True):
+                    module["instruction"] += " 核对问卷：" + "、".join(matches) + "。"
+    temp = root / f"template-{asset_id}-working.docx"
+    try:
+        save_red_template(raw, sections, temp)
+        temp.replace(root / f"template-{asset_id}-parsed.docx")
+        with SessionLocal.begin() as db:
+            asset = db.get(SurveyAsset, asset_id)
+            asset.details = {**details, "sections": sections, "ready": True}
+            db.get(SurveyTemplateParse, asset_id).state = "done"
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def preparation_inputs(batch_id):
@@ -372,6 +425,8 @@ def publish_modern(path, red_path, report_id, document, checkpoint, notice):
                 if attempt == 2:
                     raise
                 if document["template"]:
+                    if document["template"][1].get("structured"):
+                        raise
                     document = {**document, "template": None}
                     notice = "；".join(filter(None, [notice, "Word 版式校验失败，已使用本级内置版式"]))
         temp.replace(path)
@@ -388,6 +443,15 @@ def publish_modern(path, red_path, report_id, document, checkpoint, notice):
 
 async def process_modern_report(report_id, options, config, path, modern):
     level, org, outline, facts = options["level"], options["org"], modern["outline"], modern["facts"]
+    template = options["template"]
+    if template and template[1].get("structured"):
+        sections = template[1]["sections"]
+        outline = [
+            {**chapter, "instruction": chapter["instruction"] + "。按模板中对应章节执行。"
+             + " ".join(module["instruction"] for section in sections if section["role"] == chapter["key"]
+                        for module in section["modules"])[:3500]}
+            for chapter in outline
+        ]
     missing, checkpoint = modern["missing"], dict(modern["draft"])
     report_missing = [{key: item.get(key, "") for key in ("name", "source", "reason")}
                       for item in missing + [item for item in modern["annual"] if item["reason"]]]
@@ -450,6 +514,19 @@ async def process_report(report_id: int):
     if modern:
         await process_modern_report(report_id, options, config, path, modern)
         return
+    if options["template"] and options["template"][1].get("structured"):
+        facts = facts_for(options["surveys"], False, [], [], [])
+        draft = default_draft(facts, options["level"], red=False)
+        temp = path.with_suffix(".working")
+        try:
+            await asyncio.to_thread(render_word, temp, **options, outline=[], draft=draft,
+                                    facts=facts, annual=[], missing=[])
+            temp.replace(path)
+            with SessionLocal.begin() as db:
+                db.get(SurveyReport, report_id).state = "done"
+        finally:
+            temp.unlink(missing_ok=True)
+        return
     notice = ""
     if include_ai:
         if config:
@@ -475,6 +552,8 @@ async def run_job(table, id_):
         try:
             if table is SurveyDataset:
                 await asyncio.to_thread(process_import, id_)
+            elif table is SurveyTemplateParse:
+                await asyncio.to_thread(process_template, id_)
             elif table is SurveyBatchPreparation:
                 await process_preparation(id_)
             else:
@@ -493,8 +572,9 @@ async def run_job(table, id_):
 
 async def worker():
     token = model_slots.set(asyncio.Semaphore(3))
-    jobs = {SurveyDataset: set(), SurveyBatchPreparation: set(), SurveyReport: set()}
-    limits = {SurveyDataset: 1, SurveyBatchPreparation: 1, SurveyReport: max(1, min(8, settings.SURVEY_REPORT_WORKERS))}
+    jobs = {SurveyDataset: set(), SurveyTemplateParse: set(), SurveyBatchPreparation: set(), SurveyReport: set()}
+    limits = {SurveyDataset: 1, SurveyTemplateParse: 1, SurveyBatchPreparation: 1,
+              SurveyReport: max(1, min(8, settings.SURVEY_REPORT_WORKERS))}
     next_cleanup = 0
     try:
         while True:

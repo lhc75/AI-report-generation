@@ -156,21 +156,47 @@
       <el-tab-pane label="Word 模板" name="templates">
         <div class="toolbar">
           <el-select v-model="uploadLevel" class="medium-select" aria-label="模板层级"><el-option v-for="[value, label] in levels" :key="value" :value="value" :label="label" /></el-select>
-          <label class="upload"><el-icon><Upload /></el-icon> 上传本级模板
+          <label class="upload"><el-icon><Upload /></el-icon> 上传报告并解析
+            <input aria-label="上传报告并解析" type="file" accept=".docx" multiple :disabled="busy" @change="uploadFiles($event, 'template', true)" />
+          </label>
+          <label class="upload"><el-icon><Upload /></el-icon> 上传占位符模板
             <input type="file" accept=".docx" multiple :disabled="busy" @change="uploadFiles($event, 'template')" />
           </label>
+        </div>
+        <div v-for="entry in uploadFeedback.template" :key="entry.key" class="survey-file">
+          <span>{{ entry.name }}</span><el-text :type="entry.error ? 'danger' : 'info'">{{ entry.error || '上传中' }}</el-text>
         </div>
         <el-table :data="templates">
           <el-table-column prop="name" label="模板文件" min-width="200" />
           <el-table-column label="层级" width="120"><template #default="{ row }">{{ levelNames[row.level] }}</template></el-table-column>
-          <el-table-column label="状态" width="130"><template #default="{ row }">{{ row.ready ? '已确认' : '待确认' }}</template></el-table-column>
-          <el-table-column label="操作" width="170"><template #default="{ row }">
-            <el-button link type="primary" @click="editTemplate(row)">预览与定位</el-button>
-            <el-button link type="danger" :disabled="busy" :aria-label="'删除 ' + row.name" @click="removeAsset(row)">删除</el-button>
+          <el-table-column label="状态" min-width="140"><template #default="{ row }">
+            <template v-if="row.structured">
+              <el-text :type="row.parse_state === 'failed' ? 'danger' : row.ready ? 'success' : 'info'">{{ templateStates[row.parse_state] }} · #{{ row.id }}</el-text>
+              <div v-if="row.parse_error" class="template-error">{{ row.parse_error }}</div>
+            </template>
+            <template v-else>{{ row.ready ? '已确认' : '待确认' }}</template>
+          </template></el-table-column>
+          <el-table-column label="操作" min-width="280"><template #default="{ row }">
+            <div class="template-actions">
+              <template v-if="row.structured">
+                <el-button v-if="row.ready" link type="primary" @click="editTemplate(row)">章节预览</el-button>
+                <el-button link @click="downloadTemplate(row, false)">原稿</el-button>
+                <el-button v-if="row.ready" link @click="downloadTemplate(row, true)">红字模板</el-button>
+                <el-button v-if="row.ready || row.parse_state === 'failed'" link :disabled="busy" @click="reparseTemplate(row)">{{ row.ready ? '重新解析' : '重试' }}</el-button>
+              </template>
+              <el-button v-else link type="primary" @click="editTemplate(row)">预览与定位</el-button>
+              <el-button link type="danger" :disabled="busy || templateParsing(row)" :aria-label="'删除 ' + row.name" @click="removeAsset(row)">删除</el-button>
+            </div>
           </template></el-table-column>
         </el-table>
-        <el-dialog v-model="templateOpen" title="模板段落预览" width="min(730px, 96vw)">
-          <template v-if="templateDraft">
+        <el-dialog v-model="templateOpen" :title="templateDraft?.structured ? '解析章节预览' : '模板段落预览'" width="min(730px, 96vw)">
+          <ol v-if="templateDraft?.structured" class="template-preview">
+            <li v-for="section in templateDraft.sections" :key="section.heading">
+              <strong>{{ section.path.join(' / ') }}</strong>
+              <div v-for="(module, index) in section.modules" :key="index">{{ module.instruction }}</div>
+            </li>
+          </ol>
+          <template v-else-if="templateDraft">
             <el-form label-width="100px">
               <el-form-item label="标题替换位置"><el-select v-model="templateDraft.title_index" filterable><el-option v-for="p in templateDraft.paragraphs" :key="p.index" :label="p.text" :value="p.index" /></el-select></el-form-item>
               <el-form-item label="正文插入位置"><el-select v-model="templateDraft.body_index" filterable><el-option v-for="p in templateDraft.paragraphs" :key="p.index" :label="p.text" :value="p.index" /></el-select></el-form-item>
@@ -179,7 +205,7 @@
               <li v-for="p in templateDraft.paragraphs" :key="p.index" :class="{ anchor: p.index === templateDraft.title_index || p.index === templateDraft.body_index }">{{ p.text }}</li>
             </ol>
           </template>
-          <template #footer><el-button @click="templateOpen = false">取消</el-button><el-button type="primary" :loading="busy" :disabled="!templateDraft || templateDraft.title_index == null || templateDraft.body_index == null || templateDraft.title_index === templateDraft.body_index" @click="confirmTemplate">确认位置</el-button></template>
+          <template #footer><el-button @click="templateOpen = false">{{ templateDraft?.structured ? '关闭' : '取消' }}</el-button><el-button v-if="!templateDraft?.structured" type="primary" :loading="busy" :disabled="!templateDraft || templateDraft.title_index == null || templateDraft.body_index == null || templateDraft.title_index === templateDraft.body_index" @click="confirmTemplate">确认位置</el-button></template>
         </el-dialog>
       </el-tab-pane>
 
@@ -465,7 +491,9 @@ const sourceIds = ref([])
 const importHistory = ref([])
 const mappings = reactive({})
 const sourceSettings = ref(null)
-const uploadFeedback = reactive({ data: [], questionnaire: [] })
+const uploadFeedback = reactive({ data: [], questionnaire: [], template: [] })
+const templateStates = { queued: '等待解析', running: '解析中', done: '解析完成', failed: '解析失败' }
+const templateParsing = row => ['queued', 'running'].includes(row.parse_state)
 const sources = computed(() => project.value?.assets.filter(asset => asset.kind === 'data') || [])
 const originals = computed(() => project.value?.assets.filter(asset => asset.kind === 'questionnaire') || [])
 const importedSources = computed(() => new Set(project.value?.imported_sources || []))
@@ -717,7 +745,7 @@ async function linkOriginal(assetId, value) {
   })
 }
 
-async function uploadFiles(event, kind) {
+async function uploadFiles(event, kind, parseReport = false) {
   const files = [...event.target.files]
   event.target.value = ''
   if (!files.length) return
@@ -731,6 +759,7 @@ async function uploadFiles(event, kind) {
       payload.append('file', file)
       payload.append('kind', kind)
       if (kind === 'template') payload.append('level', uploadLevel.value)
+      if (parseReport) payload.append('parse_report', 'true')
       let data
       try {
         const response = await api.post(target + '/assets', payload, { timeout: 0, silentError: !!feedback })
@@ -759,7 +788,7 @@ async function uploadFiles(event, kind) {
         selection.indicator_id = null
         selection.indicator_assets = toggleOrganizations(selection.indicator_assets, [data], true)
       }
-      if (kind === 'template' && files.length === 1) editTemplate(data)
+      if (kind === 'template' && !parseReport && files.length === 1) editTemplate(data)
     }
     await loadProject()
   })
@@ -782,6 +811,17 @@ async function startImport() {
 function editTemplate(row) {
   templateDraft.value = clone(row)
   templateOpen.value = true
+}
+
+async function reparseTemplate(row) {
+  await withBusy(async () => {
+    await api.post(endpoint.value + '/templates/' + row.id + '/parse')
+    await loadProject()
+  })
+}
+
+function downloadTemplate(row, parsed) {
+  return getDownload('/templates/' + row.id + '/file', { parsed }, row.name)
 }
 
 async function confirmTemplate() {
@@ -1094,6 +1134,7 @@ watch(id, async active => {
   sourceSettings.value = null
   uploadFeedback.data.splice(0)
   uploadFeedback.questionnaire.splice(0)
+  uploadFeedback.template.splice(0)
   preview.value = null
   tab.value = 'data'
   for (const key of Object.keys(mappings)) delete mappings[key]
@@ -1133,7 +1174,7 @@ const timer = setInterval(async () => {
   if (!id.value || polling || busy.value) return
   polling = true
   try {
-    if (importing.value) await loadProject()
+    if (importing.value || templates.value.some(templateParsing)) await loadProject()
     if (tab.value === 'plan' && Date.now() - reportStatusCheckedAt >= 5000) await loadReportStatus()
     if (tab.value === 'batches' && batch.value?.generation?.state !== 'failed'
         && (batch.value?.counts.queued || batch.value?.counts.running)) await refreshBatches()
@@ -1153,6 +1194,9 @@ h3 { font-size: 14px; margin: 7px 0; overflow-wrap: anywhere; }
 .rerun-label { margin-top: 2px; font-size: 12px; color: var(--el-text-color-secondary); }
 .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .toolbar :deep(.el-button + .el-button) { margin-left: 0; }
+.template-actions { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.template-actions :deep(.el-button + .el-button) { margin-left: 0; }
+.template-error { color: var(--el-color-danger); overflow-wrap: anywhere; }
 .spaced { margin-top: 14px; }
 .between { justify-content: space-between; }
 .school-toolbar { align-items: center; padding-bottom: 12px; border-bottom: 1px solid var(--el-border-color-light); }

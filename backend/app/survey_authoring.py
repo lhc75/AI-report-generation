@@ -7,9 +7,11 @@ from pathlib import Path
 
 from docx import Document
 from docx.shared import Cm, RGBColor
+from docx.text.paragraph import Paragraph
 
 from .survey_ai import validated_json
 from .survey_reports import chart_image, new_document
+from .survey_templates import remove_unused_document_media, replace_module, replace_paragraph_text
 
 
 LEVEL_OUTLINES = {
@@ -310,8 +312,147 @@ def clean_text(value):
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", "", str(value))
 
 
+def template_surveys(section, surveys):
+    selected = section.get("questionnaires")
+    return [survey for survey in surveys if selected is None or survey["name"] in selected]
+
+
+def template_question(surveys, section, index):
+    subject = " ".join(section["path"])
+    if "学习态度" in subject or "学科体验" in subject:
+        subject += " 喜欢"
+    if "资源" in subject:
+        subject += " 实验 需求"
+    keywords = re.findall(r"兴趣|课时|作业|教研|实验|资源|需求|喜欢|培训|习惯|师资", subject)
+    options = [(survey["name"], q) for survey in surveys for q in survey["questions"]
+               if q["n"] and q["options"] and q["kind"] in {"single", "multiple"}]
+    options.sort(key=lambda row: (-sum(keyword in row[1]["title"] for keyword in keywords),
+                                  row[1]["kind"] == "text", -row[1]["n"], row[1]["id"]))
+    return options[index % len(options)] if options else ("", None)
+
+
+def annual_for_surveys(items, surveys, all_surveys):
+    ids = {survey["id"] for survey in surveys}
+    return [item for item in items if item.get("questionnaire_id") in ids
+            or (item.get("questionnaire_id") is None and len(surveys) == len(all_surveys))]
+
+
+def structured_table(doc, role, surveys, annual, missing, question):
+    configured = [item for survey in surveys for item in survey["indicators"]]
+    if role == "scope":
+        add_table(doc, ("问卷类型", "答卷量"), [(s["name"], f"{s['sample']:,}") for s in surveys])
+    elif role == "metrics" and (annual or missing):
+        add_table(doc, ("年度指标", "结果与口径", "资料来源"), [
+            (item["name"], (item.get("value") or "未计算") + "\n" +
+             (item.get("reason") or item.get("definition", "")), item.get("source", ""))
+            for item in annual + missing])
+    elif role == "metrics" and configured:
+        add_table(doc, ("年度指标", "结果", "对应题目"),
+                  [(item["name"], item["value"], item["question"]) for item in configured])
+    elif question:
+        add_table(doc, ("作答选项", "份数", "有效作答占比"), [
+            (clean_text(option), f"{count:,}", f"{count / question['n']:.1%}")
+            for option, count in question["options"].items()])
+    else:
+        doc.add_paragraph("本节没有可制表的有效作答。")
+
+
+def render_structured_word(path, *, title, org, template, sections, draft, facts, annual, missing, surveys,
+                           red=False, notice=""):
+    original, _ = template
+    doc = Document(original)
+    nodes = list(doc.element.body)
+    source_paragraphs = {p._p: p for p in doc.paragraphs}
+    first_heading = sections[0]["heading"]
+    front = [source_paragraphs[node] for node in nodes[:first_heading] if node in source_paragraphs]
+    cover_title = next((p for p in front if p.style.name == "Title" and p.text.strip()), None)
+    if cover_title is not None:
+        replace_paragraph_text(cover_title, clean_text(title))
+    else:
+        cover_title = Paragraph(nodes[first_heading], doc._body).insert_paragraph_before(clean_text(title), "Title")
+    scope = next((p for p in front if p.style.name == "Subtitle"), None)
+    if scope is not None:
+        replace_paragraph_text(scope, clean_text(org))
+    if notice and not red:
+        p = doc.add_paragraph(clean_text(notice))
+        cover_title._p.addnext(p._p)
+    content_by_role = {item["key"]: item for item in draft}
+    written_roles = set()
+    for section in sections:
+        role = section["role"]
+        content = content_by_role[role]
+        selected = template_surveys(section, surveys)
+        section_annual = annual_for_surveys(annual, selected, surveys)
+        section_missing = annual_for_surveys(missing, selected, surveys)
+        for index, module in enumerate(section["modules"]):
+            before = list(doc.element.body)
+            kind = module["kind"]
+            if red:
+                run = doc.add_paragraph().add_run(clean_text(module["instruction"]))
+                run.font.color.rgb = RGBColor.from_string("FF0000")
+            elif kind == "text":
+                names = "、".join(dict.fromkeys(s["name"] for s in selected if s["sample"]))
+                p = doc.add_paragraph()
+                if module["indices"] and (old := source_paragraphs.get(nodes[module["indices"][0]])) is not None:
+                    p.style = old.style
+                if role not in written_roles and (selected or role == "advice"):
+                    p.add_run(clean_text(content["text"]))
+                    written_roles.add(role)
+                survey_name, question = template_question(selected, section, index)
+                if role == "scope":
+                    p.add_run(f" 本节纳入 {sum(s['sample'] for s in selected):,} 份答卷。")
+                    if any(0 < s["sample"] < 10 for s in selected):
+                        p.add_run(" 小样本结果仅描述实际作答。")
+                elif role == "metrics" and "缺项" in section["title"]:
+                    if section_missing or any(item.get("reason") for item in section_annual):
+                        for item in section_missing + [item for item in section_annual if item.get("reason")]:
+                            doc.add_paragraph(clean_text(f"{item['name']}。{item['reason']}"))
+                    else:
+                        p.add_run(" 本节按当前有效作答和已确认的统计口径呈现。")
+                elif question and role in {"metrics", "findings"}:
+                    option, count = next(iter(question["options"].items()))
+                    p.add_run(clean_text(f" {survey_name}中「{question['title']}」有 {question['n']:,} 份有效作答，"
+                                         f"「{option}」为 {count:,} 份（{count / question['n']:.1%}）。"))
+                elif not p.text:
+                    p.add_run(clean_text(f"本节以{names}的实际作答为统计范围。" if names else "本节暂无可用数据。"))
+                if role == "findings" and not section.get("questionnaires"):
+                    coverage = [fact["text"] for fact in facts.values()
+                                if fact["title"] in {"辖内答卷覆盖", "辖内指标分布"}]
+                    for value in coverage[:4]:
+                        doc.add_paragraph(clean_text(value))
+            else:
+                survey_name, question = template_question(selected, section, 0)
+                if kind == "table":
+                    if question and role not in {"scope", "metrics"}:
+                        doc.add_paragraph(clean_text(f"{survey_name} · {question['title']}"))
+                    structured_table(doc, role, selected, section_annual, section_missing, question)
+                elif question:
+                    data = list(question["options"].items())[:6]
+                    doc.add_paragraph(clean_text(f"{survey_name} · {question['title']}"))
+                    doc.add_picture(chart_image(data, question["n"]), width=Cm(12))
+                    doc.add_paragraph(clean_text("　".join(f"{i} {name}" for i, (name, _) in enumerate(data, 1))))
+                else:
+                    doc.add_paragraph("本节没有可绘图的有效作答。")
+            previous = set(before)
+            output = [node for node in doc.element.body if node not in previous]
+            replace_module(nodes, nodes[section["heading"]], module, output)
+    remove_unused_document_media(doc)
+    doc.save(path)
+    checked = Document(path)
+    expected = [(section["depth"], section["title"]) for section in sections]
+    actual = [(int(p.style.name.split()[-1]), p.text.strip()) for p in checked.paragraphs
+              if re.fullmatch(r"Heading [1-9]", p.style.name)]
+    if actual != expected or len(checked.sections) != len(doc.sections):
+        raise ValueError("Word 章节或分节与解析模板不一致")
+
+
 def render_word(path: Path, *, title, level, org, year, outline, draft, facts, annual, missing, template=None,
                 red=False, notice="", surveys=(), show_question_chart=False, annual_mode=False):
+    if template and template[1].get("structured"):
+        render_structured_word(path, title=title, org=org, template=template, sections=template[1]["sections"],
+                               draft=draft, facts=facts, annual=annual, missing=missing, surveys=surveys,
+                               red=red, notice=notice)
+        return
     doc, anchor = new_document(level, clean_text(title), template)
     original = set(doc._element.body)
     body_start = doc.add_paragraph(clean_text(f"{year} 年度  |  {org}"))

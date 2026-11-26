@@ -45,6 +45,14 @@ class SurveyDataset(Base):
     archived: Mapped[bool] = mapped_column(default=False)
 
 
+class SurveyTemplateParse(Base):
+    __tablename__ = "survey_template_parse"
+
+    id: Mapped[int] = mapped_column(ForeignKey("survey_asset.id"), primary_key=True, autoincrement=False)
+    state: Mapped[str] = mapped_column(String(16), index=True, default="queued")
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
 class SurveyIndicatorVersion(Base):
     __tablename__ = "survey_indicator_version"
 
