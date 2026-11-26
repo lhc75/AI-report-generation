@@ -7,6 +7,7 @@ import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from time import monotonic
 from zipfile import BadZipFile
 
 from docx.opc.exceptions import PackageNotFoundError
@@ -25,20 +26,12 @@ from .survey_data import SheetMapping, build_index, open_index
 from .survey_indicators import calculate_results, catalog_for_rules, indicator_values, parse_indicators
 from .survey_models import (SurveyAnalysisPhrase, SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset,
                             SurveyIndicatorVersion, SurveyProject, SurveyReport, SurveyReportDraft)
+from .survey_references import analyze_original
 from .survey_reports import build_word, report_data
+from .survey_schools import school_path
+from .survey_storage import lock_project, project_dir, recover_deleted_projects
 
 logger = logging.getLogger(__name__)
-
-
-def project_dir(project_id: int) -> Path:
-    base = (Path(settings.SURVEY_DATA_DIR) if settings.SURVEY_DATA_DIR else
-            Path(settings.STORAGE_LOCAL_DIR).resolve().parent / "survey-private").resolve()
-    public = Path(settings.STORAGE_LOCAL_DIR).resolve()
-    if base.is_relative_to(public):
-        raise ValueError("批量报告目录须位于公开下载目录之外")
-    root = base / str(project_id)
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def index_path(project_id, dataset_id):
@@ -71,11 +64,22 @@ def recover_interrupted():
 
 
 def claim(table, limit: int) -> list[int]:
-    with SessionLocal.begin() as db:
-        ids = db.scalars(select(table.id).where(table.state == "queued").order_by(table.id).limit(limit)).all()
-        return [id_ for id_ in ids if db.execute(
-            update(table).where(table.id == id_, table.state == "queued").values(state="running", error="")
-        ).rowcount == 1]
+    if table is SurveyDataset:
+        candidates = select(table.id, table.project_id).where(table.archived.is_(False))
+    else:
+        batch_id = table.id if table is SurveyBatchPreparation else table.batch_id
+        candidates = select(table.id, SurveyBatch.project_id).join(SurveyBatch, batch_id == SurveyBatch.id)
+    with SessionLocal() as db:
+        jobs = db.execute(candidates.where(table.state == "queued").order_by(table.id).limit(limit)).all()
+    claimed = []
+    for job_id, project_id in jobs:
+        with SessionLocal.begin() as db:
+            if lock_project(db, project_id) is None:
+                continue
+            if db.execute(update(table).where(table.id == job_id, table.state == "queued")
+                          .values(state="running", error="")).rowcount == 1:
+                claimed.append(job_id)
+    return claimed
 
 
 def process_import(dataset_id: int):
@@ -96,8 +100,9 @@ def process_import(dataset_id: int):
 
     build_index(index_path(project_id, dataset_id), province, sources, progress)
     with SessionLocal.begin() as db:
+        project = lock_project(db, project_id)
         db.get(SurveyDataset, dataset_id).state = "done"
-        db.get(SurveyProject, project_id).dataset_id = dataset_id
+        project.dataset_id = dataset_id
 
 
 def preparation_inputs(batch_id):
@@ -118,7 +123,9 @@ def preparation_inputs(batch_id):
         for asset_id in batch.config["indicator_assets"]:
             asset = db.get(SurveyAsset, asset_id)
             materials.append((asset.name, root / asset.path))
-        return (project.id, dataset.id, levels, sources, questions, questionnaire_ids, materials,
+        originals = [{**item, "path": root / db.get(SurveyAsset, item["asset_id"]).path}
+                     for item in batch.config.get("questionnaire_originals", [])]
+        return (project.id, dataset.id, levels, sources, questions, questionnaire_ids, materials, originals,
                 model_for(db, project.user_id, "analyze"), db.get(SurveyBatchPreparation, batch_id).checkpoint)
 
 
@@ -142,9 +149,30 @@ def calculate_batch_indicators(project_id, dataset_id, batch_id, sources, rules)
 
 async def process_preparation(batch_id):
     (project_id, dataset_id, levels, sources, questions, questionnaire_ids,
-     materials, config, checkpoint) = await asyncio.to_thread(preparation_inputs, batch_id)
+     materials, originals, config, checkpoint) = await asyncio.to_thread(preparation_inputs, batch_id)
+    if originals and "originals_checked" not in checkpoint:
+        checked = dict(checkpoint.get("originals", {}))
+        issues = list(checkpoint.get("original_issues", []))
+        complete = list(checkpoint.get("originals_complete", []))
+        for material in originals:
+            if material["asset_id"] in complete:
+                continue
+            qid = material["questionnaire_id"]
+            scoped = {key: row for key, row in questions.items() if row["questionnaire_id"] == qid}
+            notes, problems = await analyze_original(config, material, scoped)
+            checked.setdefault(str(qid), []).extend(notes)
+            issues.extend(problems)
+            complete.append(material["asset_id"])
+            checkpoint = {**checkpoint, "originals": checked, "original_issues": issues, "originals_complete": complete}
+            await asyncio.to_thread(save_preparation, batch_id, checkpoint)
+        checkpoint = {**checkpoint, "originals_checked": True, "stage": "解析年度指标"}
+        await asyncio.to_thread(save_preparation, batch_id, checkpoint)
     if "rules" not in checkpoint:
-        rules, missing = await parse_indicators(config, materials, questions, questionnaire_ids)
+        if checkpoint.get("originals"):
+            rules, missing = await parse_indicators(config, materials, questions, questionnaire_ids,
+                                                    originals=checkpoint["originals"])
+        else:
+            rules, missing = await parse_indicators(config, materials, questions, questionnaire_ids)
         checkpoint = {**checkpoint, "stage": "统计年度指标", "rules": rules, "missing": missing}
         await asyncio.to_thread(save_preparation, batch_id, checkpoint)
     if not checkpoint.get("calculated"):
@@ -157,8 +185,8 @@ async def process_preparation(batch_id):
         if level in outlines:
             continue
         taken = {chapter["title"] for outline in outlines.values() for chapter in outline}
-        names = list(dict.fromkeys(rule["name"] for rule in checkpoint["rules"]))
-        outlines[level], notices[level] = await make_outline(config, level, names[:100], taken)
+        names = {item["name"] for item in checkpoint["rules"] + checkpoint["missing"]}
+        outlines[level], notices[level] = await make_outline(config, level, names, taken)
         checkpoint = {**checkpoint, "outlines": dict(outlines), "notices": dict(notices)}
         await asyncio.to_thread(save_preparation, batch_id, checkpoint)
     await asyncio.to_thread(save_preparation, batch_id, {**checkpoint, "stage": "生成报告"}, done=True)
@@ -231,6 +259,9 @@ def prepare_report(report_id: int) -> dict:
                     differences = indicator_differences(index, results, job.org_id, job.questionnaires, rules)
                 missing = [item for item in preparation.checkpoint["missing"]
                            if item.get("questionnaire_id") is None or item["questionnaire_id"] in job.questionnaires]
+                selected = {item["name"] for item in annual + missing}
+                excluded = {item["name"] for item in rules + preparation.checkpoint["missing"] if
+                            item.get("questionnaire_id") not in (None, *job.questionnaires)} - selected
                 annual_mode = bool(batch.config["indicator_assets"] or batch.indicator_id)
                 facts = facts_for(surveys, annual_mode, annual,
                                   jurisdiction_coverage(index, job.org_id, job.questionnaires), differences)
@@ -239,14 +270,18 @@ def prepare_report(report_id: int) -> dict:
                     "batch_id": batch.id, "outline": preparation.checkpoint["outlines"][job.org_level],
                     "notice": preparation.checkpoint["notices"][job.org_level], "annual_mode": annual_mode,
                     "annual": annual, "missing": missing, "facts": facts,
+                    "excluded_indicators": excluded,
+                    "originals": [note for qid in job.questionnaires for note in
+                                  preparation.checkpoint.get("originals", {}).get(str(qid), [])[:20]][:60],
                     "draft": draft.checkpoint if draft else {}, "analysis_path": analysis_path(project.id, job.id),
                     "review_model": model_for(db, project.user_id, "review") or config,
                 }
-        title = f"{project.year} 年 {job.org_path.rsplit(' / ', 1)[-1]} 问卷统计报告"
+        display_path = school_path(job.org_path, job.school_stage)
+        title = f"{project.year} 年 {display_path.rsplit(' / ', 1)[-1]} 问卷统计报告"
         if len(surveys) == 1:
             title = f"{title}  {surveys[0]['name']}"
         return {
-            "path": report_path(project.id, report_id), "title": title, "org": job.org_path,
+            "path": report_path(project.id, report_id), "title": title, "org": display_path,
             "year": project.year, "level": job.org_level, "surveys": surveys, "config": config,
             "include_ai": job.include_ai,
             "modern": modern,
@@ -358,6 +393,10 @@ async def process_modern_report(report_id, options, config, path, modern):
                       for item in missing + [item for item in modern["annual"] if item["reason"]]]
     checkpoint["missing"] = report_missing
     write_args = {"level": level, "org": org, "outline": outline, "facts": facts, "missing": report_missing}
+    if modern["excluded_indicators"]:
+        write_args["excluded_indicators"] = modern["excluded_indicators"]
+    if modern["originals"]:
+        write_args["originals"] = modern["originals"]
     notices = list(checkpoint.get("notices", []))
     if "analysis" not in checkpoint:
         try:
@@ -379,6 +418,8 @@ async def process_modern_report(report_id, options, config, path, modern):
         await asyncio.to_thread(save_report_checkpoint, report_id, checkpoint)
     if "approved" not in checkpoint:
         review_args = {"level": level, "outline": outline, "facts": facts, "missing": report_missing}
+        if modern["originals"]:
+            review_args["originals"] = modern["originals"]
         try:
             candidate = checkpoint["body"]
             approved, feedback = await review_sections(modern["review_model"], **review_args, draft=candidate)
@@ -454,8 +495,12 @@ async def worker():
     token = model_slots.set(asyncio.Semaphore(3))
     jobs = {SurveyDataset: set(), SurveyBatchPreparation: set(), SurveyReport: set()}
     limits = {SurveyDataset: 1, SurveyBatchPreparation: 1, SurveyReport: max(1, min(8, settings.SURVEY_REPORT_WORKERS))}
+    next_cleanup = 0
     try:
         while True:
+            if monotonic() >= next_cleanup:
+                await asyncio.to_thread(recover_deleted_projects)
+                next_cleanup = monotonic() + 30
             for table, active in jobs.items():
                 for task in tuple(active):
                     if task.done():

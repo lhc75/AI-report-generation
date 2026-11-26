@@ -6,12 +6,14 @@ import json
 import tempfile
 from contextlib import closing, contextmanager
 from pathlib import Path
+from typing import Annotated
+from urllib.parse import quote
 from uuid import UUID, uuid4
 from zipfile import ZIP_STORED, ZipFile
 
 from docx import Document
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -25,17 +27,24 @@ from ..db import get_db
 from ..deps import get_current_user
 from ..llm import allow_model_failover, chat_completion
 from ..models import User
-from ..survey_data import Level, SheetMapping, inspect_workbook, open_index
+from ..survey_data import (ANSWER_EXTENSIONS, Level, SheetMapping, clean, detect_fields, inspect_workbook,
+                           open_answer_sheets, open_index)
 from ..survey_models import (SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyIndicatorVersion,
                              SurveyProject, SurveyReport, SurveyReportDraft)
 from ..survey_reports import (WORD_TYPE, BatchSettings, IndicatorRule, check_rules, preview_reports, question_catalog,
                               question_options, safe_filename, scope_catalog, template_preview)
-from ..survey_worker import analysis_path, index_path, model_for, project_dir, report_path
+from ..survey_references import REFERENCE_EXTENSIONS, linked_questionnaire, reference_excerpt
+from ..survey_schools import read_roster, roster_template, school_path
+from ..survey_storage import (ACTIVE, active_batch, active_import, lock_project, project_dir,
+                               purge_archived_inputs, purge_project, remove_project_records)
+from ..survey_worker import analysis_path, index_path, model_for, report_path
 
 router = APIRouter(prefix="/api/surveys", tags=["survey"])
 MAX_UPLOAD = 200 * 1024 * 1024
 ZIP_PART_SIZE = 100
 extract_gate = asyncio.Lock()
+# Start write transactions after the authentication read, so MySQL takes its snapshot after locking the project.
+WriteSession = Annotated[Session, Depends(get_db, use_cache=False)]
 
 
 class ProjectInput(BaseModel):
@@ -58,6 +67,11 @@ class TemplateInput(BaseModel):
     body_index: int = Field(ge=0)
 
 
+class OriginalLink(BaseModel):
+    dataset_id: int
+    questionnaire_id: int | None
+
+
 class IndicatorInput(BaseModel):
     dataset_id: int
     asset_id: int | None = None
@@ -68,9 +82,9 @@ class SubmitInput(BatchSettings):
     request_id: UUID
 
 
-def owned(db, project_id, user):
-    row = db.get(SurveyProject, project_id)
-    if not row or row.user_id != user.id:
+def owned(db, project_id, user, *, write=False):
+    row = lock_project(db, project_id, user_id=user.id) if write else db.get(SurveyProject, project_id)
+    if not row or row.deleted or row.user_id != user.id:
         raise HTTPException(404, "批量报告项目不存在")
     return row
 
@@ -82,12 +96,27 @@ def belongs(db, model, item_id, project_id):
     return row
 
 
+def visible_asset(db, project_id, asset_id):
+    row = belongs(db, SurveyAsset, asset_id, project_id)
+    if row.archived:
+        raise HTTPException(404, "资料已删除")
+    return row
+
+
+def school_roster(db, project_id):
+    return db.scalar(select(SurveyAsset).where(SurveyAsset.project_id == project_id,
+                     SurveyAsset.kind == "school", SurveyAsset.archived.is_(False)))
+
+
 @contextmanager
 def dataset(db, project_id, dataset_id):
     row = belongs(db, SurveyDataset, dataset_id, project_id)
     if row.state != "done":
         raise HTTPException(409, "请先完成答卷导入")
-    with closing(open_index(index_path(project_id, dataset_id))) as index:
+    path = index_path(project_id, dataset_id)
+    if row.archived and not path.is_file():
+        raise HTTPException(404, "答卷导入版本已删除")
+    with closing(open_index(path)) as index:
         yield index
 
 
@@ -96,7 +125,8 @@ def project_values(row):
 
 
 def asset_values(row):
-    return {"id": row.id, "name": row.name, "kind": row.kind, **row.details}
+    details = {"counts": row.details["counts"]} if row.kind == "school" else row.details
+    return {"id": row.id, "name": row.name, "kind": row.kind, **details}
 
 
 def dataset_values(row):
@@ -105,7 +135,8 @@ def dataset_values(row):
 
 @router.get("")
 def list_projects(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return [project_values(row) for row in db.scalars(select(SurveyProject).where(SurveyProject.user_id == user.id)
+    return [project_values(row) for row in db.scalars(select(SurveyProject).where(
+        SurveyProject.user_id == user.id, SurveyProject.deleted.is_(False))
                                                        .order_by(SurveyProject.id.desc()))]
 
 
@@ -122,14 +153,50 @@ def create_project(data: ProjectInput, user: User = Depends(get_current_user), d
 @router.get("/{project_id}")
 def project_detail(project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     project = owned(db, project_id, user)
-    assets = db.scalars(select(SurveyAsset).where(SurveyAsset.project_id == project_id).order_by(SurveyAsset.id))
+    assets = db.scalars(select(SurveyAsset).where(SurveyAsset.project_id == project_id,
+                        SurveyAsset.archived.is_(False)).order_by(SurveyAsset.id))
     versions = db.scalars(select(SurveyIndicatorVersion).where(
         SurveyIndicatorVersion.project_id == project_id).order_by(SurveyIndicatorVersion.id.desc()))
-    latest = db.scalar(select(SurveyDataset).where(SurveyDataset.project_id == project_id)
+    latest = db.scalar(select(SurveyDataset).where(SurveyDataset.project_id == project_id,
+                       SurveyDataset.archived.is_(False))
                        .order_by(SurveyDataset.id.desc()).limit(1))
-    return {**project_values(project), "assets": [asset_values(row) for row in assets],
+    files = [asset_values(row) for row in assets]
+    originals = [item for item in files if item["kind"] == "questionnaire"]
+    if originals and project.dataset_id:
+        with dataset(db, project_id, project.dataset_id) as index:
+            questionnaires = [dict(row) for row in index.execute("SELECT id,name FROM questionnaire")]
+        for item in originals:
+            match = linked_questionnaire(item["name"], item, questionnaires)
+            item["linked_questionnaire_id"] = match["id"] if match else None
+    return {**project_values(project), "assets": files,
+            "school_roster_id": next((item["id"] for item in files if item["kind"] == "school"), None),
             "indicators": [{"id": row.id, "dataset_id": row.dataset_id, "asset_id": row.asset_id, "rules": row.rules}
-                           for row in versions], "latest_import": dataset_values(latest) if latest else None}
+                           for row in versions], "latest_import": dataset_values(latest) if latest else None,
+            "imported_sources": [source["asset_id"] for source in db.get(SurveyDataset, project.dataset_id).sources]
+            if project.dataset_id else []}
+
+
+@router.delete("/{project_id}")
+def delete_project(project_id: int, user: User = Depends(get_current_user), db: WriteSession = None):
+    project = owned(db, project_id, user, write=True)
+    if importing := active_import(db, project_id):
+        status = "正在导入" if importing.state == "running" else "正在排队"
+        raise HTTPException(409, f"答卷导入版本 #{importing.id} {status}，请在完成后删除项目")
+    if batch := active_batch(db, project_id):
+        status = "正在生成" if batch.state == "running" else "正在排队"
+        raise HTTPException(409, f"出报批次 #{batch.id} {status}，请在完成后删除项目")
+    remove_project_records(db, project)
+    db.commit()
+    purge_project(project_id)
+    return {"ok": True}
+
+
+@router.get("/{project_id}/school-template")
+def download_school_template(project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    owned(db, project_id, user)
+    filename = quote("学校信息模板.xlsx")
+    return Response(roster_template(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
 
 
 def save_upload(stream, path):
@@ -149,21 +216,39 @@ def save_upload(stream, path):
 
 @router.post("/{project_id}/assets")
 def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level | None = Form(None),
-           user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    owned(db, project_id, user)
+           user: User = Depends(get_current_user), db: WriteSession = None):
+    owned(db, project_id, user, write=True)
     name = file.filename or ""
     extension = Path(name).suffix.lower()
-    allowed = {"data": {".xlsx"}, "template": {".docx"}, "indicator": {".xlsx", ".docx", ".pdf"}}
+    allowed = {"data": ANSWER_EXTENSIONS, "template": {".docx"}, "indicator": {".xlsx", ".docx", ".pdf"},
+               "questionnaire": REFERENCE_EXTENSIONS, "school": {".xlsx"}}
     if Path(name).name != name or "\\" in name or len(name) > 255 or extension not in allowed.get(kind, ()):
         raise HTTPException(422, "请选择有效的文件格式和文件名")
     if kind == "template" and level is None:
         raise HTTPException(422, "请选择模板所属层级")
+    if kind == "school":
+        if not file.size or file.size > MAX_UPLOAD:
+            raise HTTPException(422, "请选择非空且不超过 200 MB 的学校信息表")
+        try:
+            details = read_roster(file.file)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(422, "学校信息表无法读取，请检查 Excel 格式") from exc
+        if existing := school_roster(db, project_id):
+            existing.archived = True
+            existing.details = {}
+        row = SurveyAsset(project_id=project_id, kind=kind, name=name, path="", digest="", details=details)
+        db.add(row)
+        db.commit()
+        return asset_values(row)
     path = project_dir(project_id) / f"asset-{uuid4().hex}{extension}"
     retained = False
     try:
         digest = save_upload(file.file, path)
         existing = db.scalars(select(SurveyAsset).where(SurveyAsset.project_id == project_id,
-                                                        SurveyAsset.kind == kind, SurveyAsset.digest == digest)
+                                                        SurveyAsset.kind == kind, SurveyAsset.digest == digest,
+                                                        SurveyAsset.archived.is_(False))
                               .order_by(SurveyAsset.id.desc()))
         for row in existing:
             if kind != "template" or row.details["level"] == level:
@@ -172,6 +257,8 @@ def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level |
             details = {"sheets": inspect_workbook(path, name)}
         elif kind == "template":
             details = {**template_preview(path), "level": level, "ready": False}
+        elif kind == "questionnaire":
+            details = {"has_text": bool(reference_excerpt(path))}
         else:
             details = {}
         row = SurveyAsset(project_id=project_id, kind=kind, name=name, path=path.name, digest=digest, details=details)
@@ -189,11 +276,70 @@ def upload(project_id: int, file: UploadFile, kind: str = Form(), level: Level |
             path.unlink(missing_ok=True)
 
 
+@router.delete("/{project_id}/assets/{asset_id}")
+def delete_asset(project_id: int, asset_id: int, user: User = Depends(get_current_user),
+                 db: WriteSession = None):
+    project = owned(db, project_id, user, write=True)
+    row = visible_asset(db, project_id, asset_id)
+    cleared = False
+    if row.kind == "data":
+        pending = active_import(db, project_id)
+        if pending and any(item["asset_id"] == asset_id for item in pending.sources):
+            raise HTTPException(409, f"答卷导入版本 #{pending.id} 正在处理该文件")
+        current = db.get(SurveyDataset, project.dataset_id) if project.dataset_id else None
+        if current and any(item["asset_id"] == asset_id for item in current.sources):
+            project.dataset_id = None
+            cleared = True
+    row.archived = True
+    db.commit()
+    purge_archived_inputs(project_id)
+    return {"ok": True, "cleared_current": cleared}
+
+
+@router.put("/{project_id}/questionnaire-originals/{asset_id}")
+def link_original(project_id: int, asset_id: int, data: OriginalLink, user: User = Depends(get_current_user),
+                  db: WriteSession = None):
+    project = owned(db, project_id, user, write=True)
+    row = visible_asset(db, project_id, asset_id)
+    if row.kind != "questionnaire":
+        raise HTTPException(422, "请选择问卷原稿")
+    if data.dataset_id != project.dataset_id:
+        raise HTTPException(409, "答卷版本已更新，请刷新后重试")
+    with dataset(db, project_id, data.dataset_id) as index:
+        name = None
+        if data.questionnaire_id is not None:
+            match = index.execute("SELECT name FROM questionnaire WHERE id=?", (data.questionnaire_id,)).fetchone()
+            if match is None:
+                raise HTTPException(422, "请选择已导入的问卷类型")
+            name = match["name"]
+    row.details = {**row.details, "questionnaire_name": name}
+    db.commit()
+    return asset_values(row)
+
+
+@router.get("/{project_id}/assets/{asset_id}/headers")
+def answer_headers(project_id: int, asset_id: int, sheet: str, header: int,
+                   user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    owned(db, project_id, user)
+    row = visible_asset(db, project_id, asset_id)
+    if row.kind != "data" or not 1 <= header <= 200 or sheet not in {item["sheet"] for item in row.details["sheets"]}:
+        raise HTTPException(422, "请选择有效的工作表和表头行号")
+    try:
+        with open_answer_sheets(project_dir(project_id) / row.path) as book:
+            with closing(book[sheet].iter_rows(min_row=header, values_only=True)) as rows:
+                values = next(rows, ())
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, "读取表头失败") from exc
+    if not any(clean(value) for value in values):
+        raise HTTPException(422, "该行没有表头")
+    return {"headers": [clean(value)[:250] for value in values], "fields": detect_fields(values)}
+
+
 @router.put("/{project_id}/templates/{asset_id}")
 def set_template(project_id: int, asset_id: int, data: TemplateInput, user: User = Depends(get_current_user),
-                 db: Session = Depends(get_db)):
-    owned(db, project_id, user)
-    row = belongs(db, SurveyAsset, asset_id, project_id)
+                 db: WriteSession = None):
+    owned(db, project_id, user, write=True)
+    row = visible_asset(db, project_id, asset_id)
     if row.kind != "template":
         raise HTTPException(422, "请选择 Word 模板")
     valid = {item["index"] for item in row.details["paragraphs"]}
@@ -210,11 +356,13 @@ def set_template(project_id: int, asset_id: int, data: TemplateInput, user: User
 
 @router.post("/{project_id}/imports")
 def create_import(project_id: int, data: ImportInput, user: User = Depends(get_current_user),
-                  db: Session = Depends(get_db)):
-    owned(db, project_id, user)
+                  db: WriteSession = None):
+    owned(db, project_id, user, write=True)
+    if pending := active_import(db, project_id):
+        raise HTTPException(409, f"答卷导入版本 #{pending.id} 正在处理")
     valid = set()
     for source in data.sources:
-        row = belongs(db, SurveyAsset, source.asset_id, project_id)
+        row = visible_asset(db, project_id, source.asset_id)
         if row.kind != "data" or row.digest in valid:
             raise HTTPException(422, "请选择不重复的答卷工作簿")
         valid.add(row.digest)
@@ -227,11 +375,40 @@ def create_import(project_id: int, data: ImportInput, user: User = Depends(get_c
     return dataset_values(row)
 
 
+@router.get("/{project_id}/imports")
+def list_imports(project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    project = owned(db, project_id, user)
+    rows = db.scalars(select(SurveyDataset).where(SurveyDataset.project_id == project_id,
+                      SurveyDataset.archived.is_(False)).order_by(SurveyDataset.id.desc()))
+    return [{"id": row.id, "state": row.state, "error": row.error, "source_count": len(row.sources),
+             "current": project.dataset_id == row.id} for row in rows]
+
+
+@router.delete("/{project_id}/imports/{dataset_id}")
+def delete_import(project_id: int, dataset_id: int, user: User = Depends(get_current_user),
+                  db: WriteSession = None):
+    project = owned(db, project_id, user, write=True)
+    row = belongs(db, SurveyDataset, dataset_id, project_id)
+    if row.archived:
+        raise HTTPException(404, "答卷导入版本已删除")
+    if row.state in ACTIVE:
+        raise HTTPException(409, f"答卷导入版本 #{row.id} 正在处理，请在完成后删除")
+    cleared = project.dataset_id == row.id
+    if cleared:
+        project.dataset_id = None
+    row.archived = True
+    db.commit()
+    purge_archived_inputs(project_id)
+    return {"ok": True, "cleared_current": cleared}
+
+
 @router.get("/{project_id}/catalog")
 def catalog(project_id: int, dataset_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     owned(db, project_id, user)
+    roster = school_roster(db, project_id)
     with dataset(db, project_id, dataset_id) as index:
-        return scope_catalog(index)
+        return {**scope_catalog(index, roster.details["schools"] if roster else {}),
+                "school_roster_id": roster.id if roster else None}
 
 
 @router.get("/{project_id}/questions")
@@ -271,7 +448,7 @@ def reference_text(path: Path) -> str:
 async def suggest(project_id: int, dataset_id: int, asset_id: int, user: User = Depends(get_current_user),
                   db: Session = Depends(get_db)):
     owned(db, project_id, user)
-    asset = belongs(db, SurveyAsset, asset_id, project_id)
+    asset = visible_asset(db, project_id, asset_id)
     if asset.kind != "indicator":
         raise HTTPException(422, "请选择年度指标资料")
     config = model_for(db, user.id, "analyze")
@@ -317,9 +494,11 @@ async def suggest(project_id: int, dataset_id: int, asset_id: int, user: User = 
 
 @router.post("/{project_id}/indicators")
 def save_indicators(project_id: int, data: IndicatorInput, user: User = Depends(get_current_user),
-                    db: Session = Depends(get_db)):
-    owned(db, project_id, user)
-    if data.asset_id and belongs(db, SurveyAsset, data.asset_id, project_id).kind != "indicator":
+                    db: WriteSession = None):
+    project = owned(db, project_id, user, write=True)
+    if data.dataset_id != project.dataset_id:
+        raise HTTPException(409, "答卷版本已更新，请刷新后重试")
+    if data.asset_id and visible_asset(db, project_id, data.asset_id).kind != "indicator":
         raise HTTPException(422, "请选择年度指标资料")
     try:
         with dataset(db, project_id, data.dataset_id) as index:
@@ -334,18 +513,24 @@ def save_indicators(project_id: int, data: IndicatorInput, user: User = Depends(
 
 
 def plan(db, project_id, data):
+    if db.get(SurveyProject, project_id).dataset_id != data.dataset_id:
+        raise HTTPException(409, "当前答卷版本已更新，请重新选择并预览")
+    roster = school_roster(db, project_id)
+    if "school_roster_id" in data.model_fields_set and data.school_roster_id != (roster.id if roster else None):
+        raise HTTPException(409, "学校信息已更新，请重新预览")
     for asset_id in data.indicator_assets:
-        if belongs(db, SurveyAsset, asset_id, project_id).kind != "indicator":
+        if visible_asset(db, project_id, asset_id).kind != "indicator":
             raise HTTPException(422, "请选择年度指标资料")
     if data.indicator_id is not None:
         rule_set = belongs(db, SurveyIndicatorVersion, data.indicator_id, project_id)
         if rule_set.dataset_id != data.dataset_id:
             raise HTTPException(422, "指标映射需要使用同一答卷版本")
     templates = {item.id: item.details for item in db.scalars(select(SurveyAsset).where(
-        SurveyAsset.project_id == project_id, SurveyAsset.kind == "template")) if item.details["ready"]}
+        SurveyAsset.project_id == project_id, SurveyAsset.kind == "template",
+        SurveyAsset.archived.is_(False))) if item.details["ready"]}
     try:
         with dataset(db, project_id, data.dataset_id) as index:
-            return preview_reports(index, data, templates)
+            return preview_reports(index, data, templates, roster.details["schools"] if roster else {})
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -360,15 +545,15 @@ def preview(project_id: int, data: BatchSettings, user: User = Depends(get_curre
 
 @router.post("/{project_id}/batches")
 def submit(project_id: int, data: SubmitInput, user: User = Depends(get_current_user),
-           db: Session = Depends(get_db)):
-    owned(db, project_id, user)
+           db: WriteSession = None):
+    owned(db, project_id, user, write=True)
     return save_batch(db, project_id, data.model_copy(update={"automatic": False, "indicator_assets": []}))
 
 
 @router.post("/{project_id}/generate")
 def generate(project_id: int, data: SubmitInput, user: User = Depends(get_current_user),
-             db: Session = Depends(get_db)):
-    owned(db, project_id, user)
+             db: WriteSession = None):
+    owned(db, project_id, user, write=True)
     if data.indicator_assets and data.indicator_id:
         raise HTTPException(422, "年度指标资料和已确认的指标版本请选择其中一项")
     return save_batch(db, project_id, data.model_copy(update={"automatic": True}))
@@ -382,17 +567,34 @@ def save_batch(db, project_id, data):
     summary, jobs = plan(db, project_id, data)
     if not jobs:
         raise HTTPException(422, "所选范围没有可生成的报告")
+    originals, original_issues = [], []
+    if data.automatic:
+        selected = {qid for job in jobs for qid in job["questionnaires"]}
+        with dataset(db, project_id, data.dataset_id) as index:
+            questionnaires = [dict(row) for row in index.execute("SELECT id,name FROM questionnaire")]
+        assets = db.scalars(select(SurveyAsset).where(SurveyAsset.project_id == project_id,
+                                                      SurveyAsset.kind == "questionnaire",
+                                                      SurveyAsset.archived.is_(False)).order_by(SurveyAsset.id))
+        for asset in assets:
+            match = linked_questionnaire(asset.name, asset.details, questionnaires)
+            if match is None:
+                original_issues.append({"source": asset.name, "reason": "原稿尚未关联问卷类型"})
+            elif match["id"] in selected:
+                originals.append({"asset_id": asset.id, "name": asset.name, "questionnaire_id": match["id"],
+                                  "questionnaire": match["name"], "digest": asset.digest})
     row = SurveyBatch(project_id=project_id, dataset_id=data.dataset_id, indicator_id=data.indicator_id,
                       request_id=request_id, config={"selection": data.model_dump(mode="json", exclude={"request_id"}),
                                                      "levels": summary["levels"],
-                                                     "indicator_assets": list(dict.fromkeys(data.indicator_assets))})
+                                                     "indicator_assets": list(dict.fromkeys(data.indicator_assets)),
+                                                     "questionnaire_originals": originals,
+                                                     "original_issues": original_issues})
     db.add(row)
     try:
         db.flush()
         state = "waiting" if data.automatic else "queued"
         db.add_all(SurveyReport(batch_id=row.id, state=state, **job) for job in jobs)
         if data.automatic:
-            db.add(SurveyBatchPreparation(id=row.id, checkpoint={"stage": "解析年度指标"}))
+            db.add(SurveyBatchPreparation(id=row.id, checkpoint={"stage": "核对问卷原稿" if originals else "解析年度指标"}))
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -411,6 +613,8 @@ def batch_summary(db, batch):
         generation = {"state": preparation.state, "stage": preparation.checkpoint.get("stage"),
                       "error": preparation.error, "indicator_assets": batch.config.get("indicator_assets", []),
                       "missing": preparation.checkpoint.get("missing", []),
+                      "original_issues": [*batch.config.get("original_issues", []),
+                                          *preparation.checkpoint.get("original_issues", [])],
                       "notices": preparation.checkpoint.get("notices", {})}
     counts["queued"] = counts.get("queued", 0) + counts.pop("waiting", 0)
     return {"id": batch.id, "dataset_id": batch.dataset_id, "created_at": batch.created_at,
@@ -444,6 +648,7 @@ def batch_detail(project_id: int, batch_id: int, state: str | None = None, offse
             select(SurveyReportDraft).where(SurveyReportDraft.id.in_([row.id for row in rows])))}
     return {**summary, "reports": [
         {"id": row.id, "org_path": row.org_path, "org_id": row.org_id, "org_level": row.org_level,
+         "school_stage": row.school_stage,
          "questionnaires": [questionnaires[qid] for qid in row.questionnaires],
          "state": "queued" if row.state == "waiting" else row.state, "error": row.error, "notice": row.notice,
          "missing": drafts.get(row.id, {}).get("missing", []),
@@ -452,8 +657,8 @@ def batch_detail(project_id: int, batch_id: int, state: str | None = None, offse
 
 @router.post("/{project_id}/batches/{batch_id}/retry")
 def retry_preparation(project_id: int, batch_id: int, user: User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
-    owned(db, project_id, user)
+                      db: WriteSession = None):
+    owned(db, project_id, user, write=True)
     belongs(db, SurveyBatch, batch_id, project_id)
     updated = db.execute(update(SurveyBatchPreparation).where(SurveyBatchPreparation.id == batch_id,
         SurveyBatchPreparation.state == "failed").values(state="queued", error=""))
@@ -465,8 +670,8 @@ def retry_preparation(project_id: int, batch_id: int, user: User = Depends(get_c
 
 @router.post("/{project_id}/batches/{batch_id}/reports/{report_id}/retry")
 def retry_report(project_id: int, batch_id: int, report_id: int, user: User = Depends(get_current_user),
-                 db: Session = Depends(get_db)):
-    owned(db, project_id, user)
+                 db: WriteSession = None):
+    owned(db, project_id, user, write=True)
     belongs(db, SurveyBatch, batch_id, project_id)
     updated = db.execute(update(SurveyReport).where(SurveyReport.id == report_id, SurveyReport.batch_id == batch_id,
                                                      SurveyReport.state == "failed").values(state="queued", error=""))
@@ -485,7 +690,7 @@ def download_report(project_id: int, batch_id: int, report_id: int, user: User =
     path = report_path(project_id, report_id)
     if not row or row.batch_id != batch_id or row.state != "done" or not path.is_file():
         raise HTTPException(404, "Word 文件尚不可下载")
-    name = safe_filename(row.org_path.rsplit(" / ", 1)[-1])
+    name = safe_filename(school_path(row.org_path.rsplit(" / ", 1)[-1], row.school_stage))
     return FileResponse(path, media_type=WORD_TYPE, filename=f"{name}-{report_id}.docx",
                         headers={"Cache-Control": "private, no-store"})
 
@@ -499,7 +704,7 @@ def download_analysis(project_id: int, batch_id: int, report_id: int, user: User
     path = analysis_path(project_id, report_id)
     if not row or row.batch_id != batch_id or row.state != "done" or not path.is_file():
         raise HTTPException(404, "红字解析尚不可下载")
-    name = safe_filename(row.org_path.rsplit(" / ", 1)[-1])
+    name = safe_filename(school_path(row.org_path.rsplit(" / ", 1)[-1], row.school_stage))
     return FileResponse(path, media_type=WORD_TYPE, filename=f"{name}-{report_id}-红字解析.docx",
                         headers={"Cache-Control": "private, no-store"})
 
@@ -534,7 +739,7 @@ def download_zip(project_id: int, batch_id: int, level: Level | None = None, org
     try:
         with ZipFile(target, "w", ZIP_STORED, allowZip64=True) as bundle:
             for row in rows:
-                filename = safe_filename(row.org_path.rsplit(" / ", 1)[-1])
+                filename = safe_filename(school_path(row.org_path.rsplit(" / ", 1)[-1], row.school_stage))
                 path = analysis_path(project_id, row.id) if analysis else report_path(project_id, row.id)
                 bundle.write(path, f"{row.org_level}/{filename}-{row.id}.docx")
     except Exception:

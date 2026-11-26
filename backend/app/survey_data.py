@@ -1,11 +1,12 @@
 """Import answer exports into an immutable, scope-indexed statistics file."""
 
+import csv
 import math
 import re
 import sqlite3
 import unicodedata
 from collections import Counter, defaultdict
-from contextlib import closing
+from contextlib import closing, contextmanager
 from itertools import chain, islice
 from functools import lru_cache
 from pathlib import Path
@@ -13,8 +14,10 @@ from typing import Literal
 
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
+import xlrd
 
 LEVELS = ("province", "city", "county", "school")
+ANSWER_EXTENSIONS = {".xlsx", ".xls", ".csv"}
 LABELS = dict(zip(LEVELS, ("省", "市州", "区县", "学校")))
 Level = Literal["province", "city", "county", "school"]
 ALIASES = {
@@ -69,14 +72,67 @@ def detect_fields(row) -> dict[str, int]:
     return result
 
 
+class CsvSheet:
+    title = "CSV"
+    max_row = None
+
+    def __init__(self, path):
+        self.path = path
+        self.encoding = "utf-8-sig"
+        try:
+            with path.open(encoding=self.encoding) as stream:
+                while stream.read(65536):
+                    pass
+        except UnicodeDecodeError:
+            self.encoding = "gb18030"
+
+    def rows(self):
+        with self.path.open(encoding=self.encoding, newline="") as stream:
+            yield from csv.reader(stream, strict=True)
+
+    @property
+    def values(self):
+        return self.rows()
+
+    def iter_rows(self, *, min_row, values_only):
+        return islice(self.rows(), min_row - 1, None)
+
+
+class XlsSheet:
+    def __init__(self, sheet):
+        self.sheet = sheet
+        self.title = sheet.name
+        self.max_row = sheet.nrows
+
+    @property
+    def values(self):
+        return self.iter_rows(min_row=1, values_only=True)
+
+    def iter_rows(self, *, min_row, values_only):
+        for index in range(min_row - 1, self.max_row):
+            yield self.sheet.row_values(index)
+
+
+@contextmanager
+def open_answer_sheets(path):
+    if path.suffix.lower() == ".csv":
+        yield {CsvSheet.title: CsvSheet(path)}
+    elif path.suffix.lower() == ".xls":
+        with xlrd.open_workbook(path, on_demand=True) as book:
+            yield {name: XlsSheet(book.sheet_by_name(name)) for name in book.sheet_names()}
+    else:
+        with path.open("rb") as stream, closing(load_workbook(stream, read_only=True, data_only=True)) as book:
+            yield {sheet.title: sheet for sheet in book.worksheets}
+
+
 def inspect_workbook(path: Path, filename: str) -> list[dict]:
-    with path.open("rb") as stream, closing(load_workbook(stream, read_only=True, data_only=True)) as book:
+    with open_answer_sheets(path) as book:
         result = []
-        for sheet in book.worksheets:
-            preview = [[clean(value)[:250] for value in row]
-                       for row in islice(sheet.values, 12)]
+        for sheet in book.values():
+            with closing(iter(sheet.values)) as rows:
+                preview = [[clean(value)[:250] for value in row] for row in islice(rows, 12)]
             candidates = [detect_fields(row) for row in preview]
-            if not candidates:
+            if not any(any(row) for row in preview):
                 continue
             index = max(range(len(candidates)), key=lambda i: (len(candidates[i]), sum(bool(x) for x in preview[i])))
             result.append({
@@ -348,7 +404,7 @@ def build_index(destination: Path, province: str, sources: list[tuple[Path, str,
             importer = Importer(db, province)
             for index, (path, name, mappings) in enumerate(sources, start=1):
                 on_progress(index - 1, len(sources), name)
-                with path.open("rb") as stream, closing(load_workbook(stream, read_only=True, data_only=True)) as book:
+                with open_answer_sheets(path) as book:
                     for mapping in mappings:
                         importer.import_sheet(book[mapping.sheet], mapping, name)
                 db.commit()

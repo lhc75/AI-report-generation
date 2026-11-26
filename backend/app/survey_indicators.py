@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+import re
 import sqlite3
 from collections import defaultdict
 from contextlib import closing
@@ -13,7 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from pypdf import PdfReader
 
 from .survey_ai import validated_json
-from .survey_data import ALIASES, UNANSWERED, answer_options, as_number, clean, mapped_sheet, response_scope
+from .survey_data import (ALIASES, UNANSWERED, answer_options, as_number, clean, mapped_sheet,
+                          open_answer_sheets, response_scope)
 from .survey_reports import question_catalog
 
 
@@ -174,7 +176,8 @@ INDICATOR_PROMPT = """你负责教育质量监测的年度问卷指标口径。�
 逐项提取统计要求。只输出 JSON 对象 {"items":[{"name":"资料中的指标名","location":"提供的精确位置",
 "definition":"统计范围、计算口径与预期输出","questionnaire_id":1,"reason":"","rule":{...}}]}。
 非指标段落可跳过，若没有统计要求返回空 items。缺题、资料未给定明确口径或不支持的算法，每项仍写明
-name、location、definition、reason，questionnaire_id 已知才填，rule 为 null。不得猜测选项、权重或分母。
+name、location、definition、reason，questionnaire_id 已知才填，rule 为 null。用报告读者能理解的中文说明缺项，
+写明实际缺少的题目或口径，不写程序字段名。不得猜测选项、权重或分母。
 rule 字段：name、questionnaire_id、method（count 人数、rate 比例、mean 均值、score 综合分）、
 question_id（仅需要时指定）、population（分母人群必须同时满足的筛选条件，空数组代表全部）、
 matches（比例或计数的分子条件）、denominator（eligible 为符合筛选的人，answered 为其中分子用题均有效作答的人）、
@@ -188,7 +191,7 @@ scale、offset、unit（人数或比例请留空，其他如分或学时）。�
 answered 表示有效作答并省略 value。不要跨问卷关联受访者。"""
 
 
-async def parse_indicators(config, materials, questions, questionnaire_ids):
+async def parse_indicators(config, materials, questions, questionnaire_ids, *, originals=None):
     rules, missing = [], []
     for name, path in materials:
         try:
@@ -220,7 +223,9 @@ async def parse_indicators(config, materials, questions, questionnaire_ids):
                     if item.get("rule") is None:
                         if not str(item.get("reason", "")).strip():
                             raise ValueError(f"{label} 未说明缺项原因")
-                        gaps.append({**info, "reason": str(item["reason"])[:300]})
+                        reason = re.sub(r"\s*question_id\s*", "题目对应关系", str(item["reason"]))
+                        reason = re.sub(r"\s*questionnaire_id\s*", "问卷类型", reason)
+                        gaps.append({**info, "reason": reason[:300]})
                         continue
                     try:
                         rule = AnnualRule.model_validate({**item["rule"], "name": label})
@@ -240,8 +245,10 @@ async def parse_indicators(config, materials, questions, questionnaire_ids):
                 return valid, gaps
 
             try:
-                valid, gaps = await validated_json(config, INDICATOR_PROMPT,
-                    {"指标资料": chunk, "题库": list(questions.values())}, validate, timeout=95)
+                payload = {"指标资料": chunk, "题库": list(questions.values())}
+                if originals:
+                    payload["问卷原稿对照"] = [note for notes in originals.values() for note in notes][:120]
+                valid, gaps = await validated_json(config, INDICATOR_PROMPT, payload, validate, timeout=95)
             except ValueError:
                 valid, gaps = best
                 if not gaps:
@@ -318,7 +325,7 @@ def calculate_results(destination, index, sources, mappings):
         counts = defaultdict(lambda: [0, 0, 0, 0.0])
         scopes = {}
         for path, name, sheets in sources if mappings else ():
-            with path.open("rb") as stream, closing(load_workbook(stream, read_only=True, data_only=True)) as book:
+            with open_answer_sheets(path) as book:
                 for mapping in sheets:
                     if "questionnaire" not in mapping.fields and not grouped.get(questionnaire_ids.get(mapping.questionnaire.strip())):
                         continue

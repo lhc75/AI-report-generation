@@ -17,6 +17,7 @@ class SurveyProject(Base):
     year: Mapped[int] = mapped_column(Integer)
     province: Mapped[str] = mapped_column(String(100))
     dataset_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    deleted: Mapped[bool] = mapped_column(default=False)
 
 
 class SurveyAsset(Base):
@@ -29,6 +30,7 @@ class SurveyAsset(Base):
     path: Mapped[str] = mapped_column(String(120))
     digest: Mapped[str] = mapped_column(String(64))
     details: Mapped[dict] = mapped_column(JSON)
+    archived: Mapped[bool] = mapped_column(default=False)
 
 
 class SurveyDataset(Base):
@@ -40,6 +42,7 @@ class SurveyDataset(Base):
     sources: Mapped[list] = mapped_column(JSON)
     progress: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[str] = mapped_column(Text, default="")
+    archived: Mapped[bool] = mapped_column(default=False)
 
 
 class SurveyIndicatorVersion(Base):
@@ -73,6 +76,7 @@ class SurveyReport(Base):
     org_id: Mapped[int] = mapped_column(Integer)
     org_level: Mapped[str] = mapped_column(String(16))
     org_path: Mapped[str] = mapped_column(String(900))
+    school_stage: Mapped[str | None] = mapped_column(String(16), default=None)
     template_id: Mapped[int | None] = mapped_column(ForeignKey("survey_asset.id"))
     questionnaires: Mapped[list] = mapped_column(JSON)
     include_ai: Mapped[bool] = mapped_column(default=False)

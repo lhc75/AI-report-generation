@@ -1,16 +1,21 @@
 import asyncio
+import csv
 import io
 import json
 import os
 import time
+from threading import Event
 from uuid import uuid4
 from zipfile import ZipFile
 
 import pytest
+import xlwt
 from docx import Document
 from docx.oxml.ns import qn
 from fastapi.testclient import TestClient
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from sqlalchemy import select, update
 
 from app.config import settings
@@ -18,7 +23,7 @@ from app.db import SessionLocal
 from app.main import app
 from app.models import ModelConfig, User
 from app.security import create_token
-from app.survey_models import SurveyBatchPreparation, SurveyReport, SurveyReportDraft
+from app.survey_models import SurveyAsset, SurveyBatch, SurveyBatchPreparation, SurveyDataset, SurveyProject, SurveyReport, SurveyReportDraft
 from app import survey_ai, survey_authoring, survey_worker
 
 
@@ -95,6 +100,200 @@ SMALL = [
     ("乙学校", "12", "甲市", "同名区", "教师", "满意", "图书", 40),
     ("同名学校", "21", "乙市", "同名区", "学生", "不满意", "图书；讲座", 60),
 ]
+
+
+def roster_xlsx(rows):
+    book = Workbook()
+    book.active.append(["id", "area", "city", "school", "type", "loginId", "loginPassword"])
+    for code, name, stage in rows:
+        book.active.append([code, "同名区", "甲市", name, stage, "测试账号", "测试口令"])
+    result = io.BytesIO()
+    book.save(result)
+    return result.getvalue()
+
+
+def test_school_roster_filters_school_reports_and_snapshots_stages(client):
+    http, other = client
+    primary = "学生问卷-六年级科学"
+    middle = "学生问卷-九年级物理"
+    teachers = "教师问卷"
+    rows = [
+        ("甲小学", "001", "甲市", "同名区", primary, "满意", "图书", 10),
+        ("甲小学", "001", "甲市", "同名区", middle, "满意", "图书", 11),
+        ("乙中学", "1", "甲市", "同名区", middle, "满意", "图书", 20),
+        ("乙中学", "1", "甲市", "同名区", teachers, "满意", "图书", 21),
+        ("丙学校", "003", "甲市", "同名区", primary, "满意", "图书", 30),
+    ]
+    base, dataset_id, before = prepare(http, rows)
+    params = {"dataset_id": dataset_id}
+    roster_rows = [("001", "甲小学", "小学"), ("1", "乙中学", "初中")]
+
+    def roster_upload(items):
+        return http.post(base + "/assets", data={"kind": "school"},
+                         files={"file": ("学校账号.xlsx", roster_xlsx(items))})
+
+    template_response = http.get(base + "/school-template")
+    assert template_response.is_success
+    template = load_workbook(io.BytesIO(template_response.content))
+    assert next(template.active.values) == ("id", "area", "city", "school", "type")
+    assert template.active.column_dimensions["A"].number_format == "@"
+    assert http.get(base + "/school-template", headers=other).status_code == 404
+    assert all(row.get("school_stage") == "unknown" for row in before["organizations"] if row["level"] == "school")
+
+    roster = successful(roster_upload(roster_rows))
+    assert roster["counts"] == {"primary": 1, "middle": 1}
+    assert roster_upload([*roster_rows, ("001", "甲小学", "初中")]).status_code == 422
+    assert roster_upload([("", "甲小学", "小学")]).status_code == 422
+    with SessionLocal() as db:
+        asset = db.get(SurveyAsset, roster["id"])
+        assert not asset.path
+        assert "测试口令" not in str(asset.details) and "测试账号" not in str(asset.details)
+        assert set(asset.details["schools"]) == {"001", "1"}
+    catalog = successful(http.get(base + "/catalog", params=params))
+    assert catalog["school_roster_id"] == roster["id"]
+    schools = {row["school_code"]: row for row in catalog["organizations"] if row["level"] == "school"}
+    assert {key: row["school_stage"] for key, row in schools.items()} == {"001": "primary", "1": "middle", "003": "unknown"}
+    qids = {row["name"]: row["id"] for row in catalog["questionnaires"]}
+    assert {row["name"]: row["school_stage"] for row in catalog["questionnaires"]} == {
+        primary: "primary", middle: "middle", teachers: "any"}
+    selection = {**params, "mode": "custom", "school_roster_id": roster["id"]}
+    assert http.post(base + "/preview", json={**selection, "org_ids": [schools["001"]["id"]],
+                     "questionnaire_stages": {qids[middle]: "any"}}).status_code == 422
+    only_primary = successful(http.post(base + "/preview", json={**selection, "org_ids": [schools["001"]["id"]]}))
+    row = only_primary["organizations"][0]
+    assert row["incompatible_questionnaires"] == {str(qids[middle]): 1}
+    assert row["skipped_questionnaires"] == [qids[teachers]]
+    override = successful(http.post(base + "/preview", json={**selection, "org_ids": [schools["1"]["id"]],
+                          "questionnaire_stages": {qids[teachers]: "primary"}}))
+    assert override["organizations"][0]["incompatible_questionnaires"][str(qids[teachers])] == 1
+    province = successful(http.post(base + "/preview", json={**selection, "mode": "province"}))
+    assert province["levels"]["province"]["responses"] == 5
+
+    request = {**selection, "org_ids": [row["id"] for row in schools.values()],
+               "automatic": True, "request_id": str(uuid4())}
+    preview = successful(http.post(base + "/preview", json=request))
+    assert preview["reports"] == 3 and preview["levels"]["school"]["responses"] == 4
+    batch_id = successful(http.post(base + "/generate", json=request))["id"]
+    replacement = successful(roster_upload([("001", "甲小学", "初中"), roster_rows[1]]))
+    assert replacement["id"] != roster["id"]
+    assert http.post(base + "/preview", json=request).status_code == 409
+    url = f"{base}/batches/{batch_id}"
+    batch = await_state(http, url, lambda result: result["counts"]["done"] == 3 or result["counts"]["failed"])
+    assert batch["counts"]["done"] == preview["reports"]
+    reports = {row["school_stage"]: row for row in batch["reports"]}
+    assert reports["primary"]["questionnaires"] == [primary]
+    assert set(reports["middle"]["questionnaires"]) == {middle, teachers}
+    assert reports["unknown"]["questionnaires"] == [primary]
+    report = http.get(f"{url}/reports/{reports['primary']['id']}/download")
+    assert report.is_success
+    assert any("甲小学（小学）" in p.text for p in Document(io.BytesIO(report.content)).paragraphs)
+    bundle = http.get(url + "/zip", params={"org_id": schools["001"]["id"]})
+    assert bundle.is_success
+    with ZipFile(io.BytesIO(bundle.content)) as archive:
+        assert len(archive.namelist()) == 1 and "甲小学（小学）" in archive.namelist()[0]
+    assert http.delete(f"{base}/assets/{replacement['id']}").is_success
+    assert successful(http.get(base + "/catalog", params=params))["school_roster_id"] is None
+
+
+def test_delete_survey_uploads_imports_and_project_preserves_history(client, tmp_path):
+    http, other = client
+    base, dataset_id, _ = prepare(http, SMALL)
+    project_id = int(base.rsplit("/", 1)[-1])
+    detail = successful(http.get(base))
+    source = detail["assets"][0]
+    sources = detail["latest_import"]["sources"]
+
+    def upload(kind, name, data, **fields):
+        return successful(http.post(base + "/assets", data={"kind": kind, **fields}, files={"file": (name, data)}))
+
+    template = upload("template", "封面.docx", docx_template("{{报告标题}}", "{{报告正文}}"), level="province")
+    template = successful(http.put(f"{base}/templates/{template['id']}", json={"title_index": 1, "body_index": 2}))
+    original = upload("questionnaire", "学生.docx", docx_template("学生问卷原稿"))
+    indicator = upload("indicator", "指标.docx", docx_template("测试指标"))
+    extra = upload("data", "其他答卷.xlsx", workbook(SMALL[:1]))
+    request = {"dataset_id": dataset_id, "levels": {"province": {"templates": [template["id"]]}},
+               "indicator_assets": [indicator["id"]], "request_id": str(uuid4())}
+    batch_id = successful(http.post(base + "/generate", json=request))["id"]
+    batch_url = f"{base}/batches/{batch_id}"
+    result = await_state(http, batch_url, lambda data: data["counts"]["done"] or data["counts"]["failed"])
+    assert result["counts"]["done"] == 1
+    download_url = f"{batch_url}/reports/{result['reports'][0]['id']}/download"
+    with SessionLocal() as db:
+        paths = {row.id: tmp_path / str(project_id) / row.path for row in db.scalars(select(SurveyAsset))}
+    assert paths[extra["id"]].is_file()
+    assert http.delete(f"{base}/assets/{extra['id']}", headers=other).status_code == 404
+    assert http.delete(f"{base}/imports/{dataset_id}", headers=other).status_code == 404
+    assert http.delete(base, headers=other).status_code == 404
+    assert not successful(http.delete(f"{base}/assets/{extra['id']}"))["cleared_current"]
+    assert not paths[extra["id"]].exists()
+
+    assert successful(http.delete(f"{base}/imports/{dataset_id}"))["cleared_current"]
+    assert successful(http.get(base))["dataset_id"] is None
+    assert successful(http.get(base + "/imports")) == []
+    assert http.get(download_url).is_success
+    assert http.post(base + "/preview", json=request).status_code == 409
+    assert paths[source["id"]].is_file()
+    reimport = successful(http.post(base + "/imports", json={"sources": sources}))
+    await_state(http, base, lambda data: data["dataset_id"] == reimport["id"])
+    for asset in (template, original, indicator):
+        assert http.delete(f"{base}/assets/{asset['id']}").is_success
+    assert successful(http.delete(f"{base}/assets/{source['id']}"))["cleared_current"]
+    assert successful(http.get(base))["assets"] == []
+    assert successful(http.get(base))["dataset_id"] is None
+    assert http.post(base + "/imports", json={"sources": sources}).status_code == 404
+    assert paths[source["id"]].is_file() and paths[template["id"]].is_file()
+    assert http.get(download_url).is_success
+    assert http.delete(base).is_success
+    assert http.get(base).status_code == 404 and http.get(download_url).status_code == 404
+    assert not (tmp_path / str(project_id)).exists()
+    with SessionLocal() as db:
+        assert db.get(SurveyProject, project_id) is None
+        assert list(db.scalars(select(SurveyDataset).where(SurveyDataset.project_id == project_id))) == []
+
+
+def test_deletion_conflicts_with_running_import_and_report(client, monkeypatch):
+    http, _ = client
+    base, dataset_id, _ = prepare(http, SMALL)
+    sources = successful(http.get(base))["latest_import"]["sources"]
+    started, release = Event(), Event()
+    build_index = survey_worker.build_index
+
+    def paused_build(*args):
+        started.set()
+        assert release.wait(timeout=10)
+        return build_index(*args)
+
+    monkeypatch.setattr(survey_worker, "build_index", paused_build)
+    version = successful(http.post(base + "/imports", json={"sources": sources}))
+    try:
+        assert started.wait(timeout=5)
+        for url in (base, f"{base}/assets/{sources[0]['asset_id']}", f"{base}/imports/{version['id']}"):
+            response = http.delete(url)
+            assert response.status_code == 409 and "答卷导入版本" in response.json()["detail"]
+        assert successful(http.get(base))["dataset_id"] == dataset_id
+    finally:
+        release.set()
+    await_state(http, base, lambda row: row["dataset_id"] == version["id"])
+
+    entered, resume = Event(), Event()
+    process_report = survey_worker.process_report
+
+    async def paused_report(report_id):
+        entered.set()
+        assert await asyncio.to_thread(resume.wait, 10)
+        await process_report(report_id)
+
+    monkeypatch.setattr(survey_worker, "process_report", paused_report)
+    batch_id = successful(http.post(base + "/batches", json={"dataset_id": version["id"], "request_id": str(uuid4())}))["id"]
+    try:
+        await_state(http, f"{base}/batches/{batch_id}", lambda data: data["counts"]["running"])
+        assert entered.wait(timeout=5)
+        response = http.delete(base)
+        assert response.status_code == 409 and "出报批次" in response.json()["detail"]
+    finally:
+        resume.set()
+    await_state(http, f"{base}/batches/{batch_id}", lambda data: data["counts"]["done"])
+    assert http.delete(base).is_success
 
 
 def test_scope_indicators_templates_versions_and_downloads(client):
@@ -279,6 +478,163 @@ def configure_survey_model(db):
 
 def head_titles(doc):
     return [p.text for p in doc.paragraphs if p.style.name == "Heading 1"]
+
+
+def original_docx(*lines):
+    doc = Document()
+    for line in lines:
+        doc.add_paragraph(line)
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+def original_pdf():
+    pdf = PdfWriter()
+    page = pdf.add_blank_page(width=300, height=100)
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })}),
+    })
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 12 Tf 10 65 Td (Student confidence question) Tj ET")
+    page[NameObject("/Contents")] = pdf._add_object(stream)
+    buffer = io.BytesIO()
+    pdf.write(buffer)
+    return buffer.getvalue()
+
+
+def test_originals_and_all_answer_formats(client, db, monkeypatch):
+    http, other = client
+    configure_survey_model(db)
+    project = successful(http.post("/api/surveys", json={"name": "上传验收", "province": "测试省", "year": 2026}))
+    base = f"/api/surveys/{project['id']}"
+
+    def upload(kind, name, raw):
+        return successful(http.post(base + "/assets", data={"kind": kind}, files={"file": (name, raw)}))
+
+    teacher = upload("questionnaire", "教师问卷原稿.docx",
+                     original_docx("培训参与情况", "满意度题目的原稿", "满意", "教师量表说明"))
+    student = upload("questionnaire", "学生.pdf", original_pdf())
+    pending = upload("questionnaire", "补充问卷.docx", original_docx("额外题目"))
+    assert student["has_text"]
+    assert http.post(base + "/assets", data={"kind": "data"}, files={"file": ("损坏.xlsx", b"broken")}).status_code == 422
+    xlsx = upload("data", "原始.xlsx", workbook([
+        ("乙学校", "12", "甲市", "同名区", "教师", "满意", "图书", 40),
+    ]))
+    headers = ["账号", "姓名", "学校", "学校ID", "市/州", "区县", "问卷", "满意度", "资源（多选）", "数值"]
+    csv_text = io.StringIO()
+    csv.writer(csv_text).writerows([headers, ["2", "测试姓名", "乙学校", "12", "甲市", "同名区", "教师", "不满意", "图书", 50]])
+    csv_asset = upload("data", "另一批.csv", csv_text.getvalue().encode("gb18030"))
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("答卷")
+    for row_index, row in enumerate([headers, ["3", "测试姓名", "乙学校", "12", "甲市", "同名区", "学生", "满意", "图书", 30]]):
+        for column, value in enumerate(row):
+            xls_sheet.write(row_index, column, value)
+    xls_data = io.BytesIO()
+    xls_book.save(xls_data)
+    xls_asset = upload("data", "学生答卷.xls", xls_data.getvalue())
+    source_specs = {"sources": [{"asset_id": asset["id"], "sheets": asset["sheets"]} for asset in [xlsx, csv_asset, xls_asset]]}
+    import_version = successful(http.post(base + "/imports", json=source_specs))
+    state = await_state(http, base, lambda row: row["latest_import"]["state"] in ("done", "failed"))
+    assert state["latest_import"]["state"] == "done", state
+    dataset_id = import_version["id"]
+    catalog = successful(http.get(base + "/catalog", params={"dataset_id": dataset_id}))
+    assert catalog["total"] == 3 and len(state["imported_sources"]) == 3
+    qids = {row["name"]: row["id"] for row in catalog["questionnaires"]}
+    ids = {row["id"]: row.get("linked_questionnaire_id") for row in state["assets"] if row["kind"] == "questionnaire"}
+    assert ids == {teacher["id"]: qids["教师"], student["id"]: qids["学生"], pending["id"]: None}
+    headers_response = successful(http.get(f"{base}/assets/{xlsx['id']}/headers",
+                                            params={"sheet": xlsx["sheets"][0]["sheet"], "header": 2}))
+    assert headers_response["headers"] == headers
+    link_url = f"{base}/questionnaire-originals/{teacher['id']}"
+    assert http.put(link_url, json={"dataset_id": dataset_id, "questionnaire_id": qids["教师"]}, headers=other).status_code == 404
+    assert successful(http.put(link_url, json={"dataset_id": dataset_id, "questionnaire_id": qids["教师"]}))["questionnaire_name"] == "教师"
+
+    source_calls, report_calls, corrections = [], [], []
+    teacher_note = "满意度题目的原稿"
+    student_note = "Student confidence question"
+    material = upload("indicator", "年度.docx", original_docx("统计教师答卷图书选择者中的满意率"))
+
+    async def model(_config, messages, **_kwargs):
+        payload = json.loads(messages[1]["content"])
+        if "原稿位置原文" in payload:
+            questions = payload["题库"]
+            kind = questions[0]["questionnaire"]
+            source_calls.append(kind)
+            title = teacher_note if kind == "教师" else student_note
+            location = next(key for key, text in payload["原稿位置原文"].items() if title in text)
+            item = {"question_id": next(row["id"] for row in questions if row["title"] == "满意度"),
+                    "location": location, "title": title}
+            if kind == "教师":
+                item.update(options=[{"text": "满意", "location": "段落 3"}],
+                            scale="教师量表说明", scale_location="段落 4")
+            return json.dumps({"items": [item]}, ensure_ascii=False)
+        if "指标资料" in payload:
+            assert {item["title"] for item in payload["问卷原稿对照"]} <= {teacher_note, student_note}
+            ids = {q["title"]: q["id"] for q in payload["题库"] if q["questionnaire"] == "教师"}
+            rule = {"questionnaire_id": qids["教师"], "method": "rate", "denominator": "answered",
+                    "population": [{"question_id": ids["资源（多选）"], "op": "selected", "value": "图书"}],
+                    "matches": [{"question_id": ids["满意度"], "op": "selected", "value": "满意"}]}
+            return json.dumps({"items": [{"name": "教师满意率", "location": "段落 1", "definition": "选择图书的教师中，满意度有效作答为分母",
+                                          "rule": rule, "questionnaire_id": qids["教师"]}]}, ensure_ascii=False)
+        if "章节要求" in payload:
+            assert "年度指标" not in payload
+            return json.dumps({"sections": [{"key": key, "title": title, "instruction": "按核实结果撰写"}
+                                            for key, title, _ in payload["章节要求"]]}, ensure_ascii=False)
+        notes = {item["title"] for item in payload.get("问卷原稿对照", [])}
+        report_calls.append(notes)
+        if "正文" in payload:
+            return '{"approved":true,"issues":[]}'
+        specific = ("建议结合师资情况安排校本教研。" if teacher_note in notes
+                    else "建议结合学生反馈安排学习支持。")
+        if notes == {student_note} and payload["任务"] == "红字解析":
+            if len(messages) == 2:
+                specific = "本节同时说明教师满意率和学生反馈。"
+            else:
+                corrections.append(messages[-1]["content"])
+        return json.dumps({"sections": [
+            {"key": key, "text": specific, "evidence": [choices[0]], "actor": payload["责任主体"][0]}
+            for key, choices in payload["允许引用"].items()]}, ensure_ascii=False)
+
+    monkeypatch.setattr(survey_ai, "chat_completion", model)
+    school = next(row["id"] for row in catalog["organizations"] if row["level"] == "school")
+    payload = {"dataset_id": dataset_id, "mode": "custom", "org_ids": [1, school],
+               "indicator_assets": [material["id"]], "levels": {"province": {"questionnaires": [qids["教师"]]},
+                                                                 "school": {"split": True}}}
+    assert successful(http.post(base + "/preview", json=payload))["reports"] == 3
+    assert successful(http.post(base + "/preview", json={**payload, "mode": "province"}))["reports"] == 1
+    created = successful(http.post(base + "/generate", json={**payload, "request_id": str(uuid4())}))
+    assert successful(http.put(link_url, json={"dataset_id": dataset_id, "questionnaire_id": qids["学生"]}))["questionnaire_name"] == "学生"
+    url = f"{base}/batches/{created['id']}"
+    batch = await_state(http, url, lambda row: row["counts"]["done"] == 3 or row["counts"]["failed"]
+                        or row["generation"]["state"] == "failed")
+    assert batch["counts"]["done"] == 3, batch
+    assert batch["generation"]["original_issues"] == [{"source": "补充问卷.docx", "reason": "原稿尚未关联问卷类型"}]
+    assert sorted(source_calls) == ["学生", "教师"]
+    assert any("未选择问卷" in correction for correction in corrections)
+    assert set(map(frozenset, report_calls)) == {frozenset([teacher_note]), frozenset([student_note])}
+    for report in batch["reports"]:
+        report_url = f"{url}/reports/{report['id']}"
+        doc = Document(io.BytesIO(http.get(report_url + "/download").content))
+        red = Document(io.BytesIO(http.get(report_url + "/analysis").content))
+        assert len([r for p in red.paragraphs for r in p.runs if str(r.font.color.rgb) == "FF0000"]) == 4
+        text = " ".join(p.text for p in doc.paragraphs)
+        if report["questionnaires"] == ["教师"]:
+            assert "校本教研" in text and "学习支持" not in text
+            assert any("50.0%（1 / 2）" in cell.text for table in doc.tables for row in table.rows for cell in row.cells)
+        else:
+            assert "学习支持" in text and "校本教研" not in text
+            assert "教师满意率" not in " ".join(p.text for p in red.paragraphs)
+    with SessionLocal.begin() as local:
+        saved = local.get(SurveyBatch, created["id"]).config["questionnaire_originals"]
+        assert {item["asset_id"]: item["questionnaire_id"] for item in saved} == {teacher["id"]: qids["教师"], student["id"]: qids["学生"]}
+    reimport = successful(http.post(base + "/imports", json=source_specs))
+    state = await_state(http, base, lambda row: row["dataset_id"] == reimport["id"])
+    assert next(row for row in state["assets"] if row["id"] == teacher["id"])["linked_questionnaire_id"] == qids["学生"]
+    assert http.get(f"{url}/reports/{batch['reports'][0]['id']}/download").is_success
 
 
 def test_one_click_annual_rules_fixed_outlines_and_resumable_documents(client, db, monkeypatch):

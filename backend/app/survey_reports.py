@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
 from .survey_data import LABELS, LEVELS, Level
+from .survey_schools import QuestionnaireStage, infer_stage, school_stage
 
 WORD_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 TITLE_TOKEN = "{{报告标题}}"
@@ -30,6 +31,8 @@ class LevelSettings(BaseModel):
 
 class BatchSettings(BaseModel):
     dataset_id: int
+    school_roster_id: int | None = None
+    questionnaire_stages: dict[int, QuestionnaireStage] = Field(default_factory=dict)
     indicator_id: int | None = None
     mode: Literal["province", "custom", "all", "levels"] = "province"
     enabled_levels: list[Level] = Field(default_factory=list, max_length=4)
@@ -51,18 +54,35 @@ class IndicatorRule(BaseModel):
     source: str = Field(default="", max_length=500)
 
 
-def scope_catalog(db) -> dict:
+def scope_catalog(db, schools: dict | None = None) -> dict:
+    organizations = [dict(row) for row in db.execute("SELECT * FROM org ORDER BY path,id")]
+    school_samples = {}
+    for row in db.execute("SELECT s.org,s.questionnaire FROM sample s JOIN org o ON o.id=s.org WHERE o.level='school'"):
+        school_samples.setdefault(row["org"], []).append(row["questionnaire"])
+    for org in organizations:
+        if org["level"] == "school":
+            org["school_stage"] = school_stage(org, schools or {})
+            org["questionnaire_ids"] = school_samples.get(org["id"], [])
     return {
-        "organizations": [dict(row) for row in db.execute("SELECT * FROM org ORDER BY path,id")],
-        "questionnaires": [dict(row) for row in db.execute("SELECT * FROM questionnaire ORDER BY name,id")],
+        "organizations": organizations,
+        "questionnaires": [{**dict(row), "school_stage": infer_stage(row["name"])}
+                           for row in db.execute("SELECT * FROM questionnaire ORDER BY name,id")],
         "notices": [dict(row) for row in db.execute("SELECT * FROM notice")],
         "total": db.execute("SELECT COALESCE(SUM(total),0) FROM sample WHERE org=1").fetchone()[0],
     }
 
 
-def preview_reports(db, settings: BatchSettings, templates: dict[int, dict]) -> tuple[dict, list[dict]]:
+def preview_reports(db, settings: BatchSettings, templates: dict[int, dict],
+                    schools: dict | None = None) -> tuple[dict, list[dict]]:
     orgs = {row["id"]: dict(row) for row in db.execute("SELECT * FROM org ORDER BY path,id")}
     questionnaires = {row["id"]: row["name"] for row in db.execute("SELECT * FROM questionnaire ORDER BY name,id")}
+    if settings.questionnaire_stages.keys() - questionnaires.keys():
+        raise ValueError("适用学段配置包含已失效的问卷")
+    stages = {qid: infer_stage(name) for qid, name in questionnaires.items()}
+    for qid, stage in settings.questionnaire_stages.items():
+        if stages[qid] not in ("any", stage):
+            raise ValueError(f"「{questionnaires[qid]}」的学段由年级确定")
+        stages[qid] = stage
     selected = set(settings.org_ids)
     if settings.mode == "province":
         selected = {1}
@@ -100,18 +120,24 @@ def preview_reports(db, settings: BatchSettings, templates: dict[int, dict]) -> 
         if allowed:
             assignment = override if override is not None else allowed[counters[level] % len(allowed)]
             counters[level] += 1
+        stage = school_stage(org, schools or {})
         sample = {qid: counts.get((org_id, qid), 0) for qid in chosen}
-        available = [qid for qid in chosen if sample[qid]]
+        incompatible = {qid: count for qid, count in sample.items()
+                        if stage in ("primary", "middle") and stages[qid] not in ("any", stage)}
+        available = [qid for qid in chosen if sample[qid] and qid not in incompatible]
         split = config.split and not (settings.automatic and level == "province")
-        variants = ([[qid] for qid in available] if split else [chosen]) if available else []
+        combined = available if level == "school" else chosen
+        variants = ([[qid] for qid in available] if split else [combined]) if available else []
         subtotal = groups[level]
         subtotal["organizations"] += 1
-        subtotal["responses"] += sum(sample.values())
+        subtotal["responses"] += sum(count for qid, count in sample.items() if qid not in incompatible)
         subtotal["reports"] += len(variants)
         subtotal["skipped"] += not bool(variants)
-        rows.append({**org, "template_id": assignment, "samples": sample, "reports": len(variants),
-                     "skipped_questionnaires": [qid for qid in chosen if not sample[qid]]})
+        rows.append({**org, "school_stage": stage, "template_id": assignment, "samples": sample,
+                     "reports": len(variants), "incompatible_questionnaires": incompatible,
+                     "skipped_questionnaires": [qid for qid in chosen if not sample[qid] and qid not in incompatible]})
         jobs.extend({"org_id": org_id, "org_level": level, "org_path": org["path"], "template_id": assignment,
+                     "school_stage": stage,
                      "questionnaires": variant, "include_ai": settings.automatic or org_id in known_ai}
                     for variant in variants)
     preview = {"levels": groups, "reports": len(jobs), "organizations": rows,

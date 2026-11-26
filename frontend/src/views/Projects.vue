@@ -18,7 +18,7 @@
       <el-table-column label="操作" width="160">
         <template #default="{ row }">
           <el-button type="primary" link @click="openProject(row)">进入</el-button>
-          <el-button v-if="row.mode === 'general'" type="danger" link :loading="deletingId === row.id" @click="remove(row)">删除</el-button>
+          <el-button type="danger" link :loading="deletingKey === row.mode + ':' + row.id" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
       <template #empty>暂无项目，点击右上角新建</template>
@@ -63,7 +63,7 @@ const province = ref('')
 const year = ref(new Date().getFullYear())
 const modes = { general: '通用 AI 报告', survey: '批量问卷报告' }
 const creating = ref(false)
-const deletingId = ref(null)
+const deletingKey = ref(null)
 
 function statusType(s) {
   return { analyzed: 'success', analyzing: 'warning', generating: 'warning', assembling: 'warning', failed: 'danger' }[s] || 'info'
@@ -113,18 +113,23 @@ async function create() {
 }
 
 async function remove(row) {
-  await ElMessageBox.confirm(
-    `确定删除项目「${row.name}」？上传的文件和解析结果会一并删除，不可恢复。`,
-    '删除项目',
-    { type: 'warning', confirmButtonText: '删除', confirmButtonClass: 'el-button--danger' }
-  )
-  deletingId.value = row.id
+  const survey = row.mode === 'survey'
+  const contents = survey ? '上传资料、导入版本和出报结果' : '上传的文件和解析结果'
   try {
-    await api.delete(`/projects/${row.id}`)
+    await ElMessageBox.confirm(
+      `确定删除项目「${row.name}」？${contents}会一并删除，不可恢复。`, '删除项目',
+      { type: 'warning', confirmButtonText: '删除', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch { return }
+  deletingKey.value = row.mode + ':' + row.id
+  try {
+    await api.delete((survey ? '/surveys/' : '/projects/') + row.id)
     ElMessage.success('已删除')
     await load()
+  } catch {
+    // The shared API displays request errors.
   } finally {
-    deletingId.value = null
+    deletingKey.value = null
   }
 }
 

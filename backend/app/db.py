@@ -66,6 +66,7 @@ def init_db() -> None:
 
 # 已有表的增量列：(表名, 列名, DDL)
 _COLUMN_MIGRATIONS = [
+    ("survey_report", "school_stage", "ALTER TABLE `survey_report` ADD COLUMN `school_stage` VARCHAR(16) NULL"),
     ("project", "report_path", "ALTER TABLE `project` ADD COLUMN `report_path` VARCHAR(512) NOT NULL DEFAULT ''"),
     ("project", "evidence_path", "ALTER TABLE `project` ADD COLUMN `evidence_path` VARCHAR(512) NOT NULL DEFAULT ''"),
     ("chapter_task", "slot_key", "ALTER TABLE `chapter_task` ADD COLUMN `slot_key` VARCHAR(512) NOT NULL DEFAULT ''"),
@@ -78,6 +79,9 @@ for _table, _column, _type, _default in [
     ("project", "operation_token", "VARCHAR(36)", "''"),
     ("project", "auto_report", "INTEGER", "0"),
     ("survey_report", "notice", "VARCHAR(255)", "''"),
+    ("survey_project", "deleted", "INTEGER", "0"),
+    ("survey_asset", "archived", "INTEGER", "0"),
+    ("survey_dataset", "archived", "INTEGER", "0"),
     ("project", "material_revision", "INTEGER", "0"),
     ("project", "last_run_id", "VARCHAR(36)", "''"),
     ("project", "last_run_result", "TEXT", "'{}'"),
