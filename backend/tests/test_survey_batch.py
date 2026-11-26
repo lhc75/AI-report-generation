@@ -296,6 +296,96 @@ def test_deletion_conflicts_with_running_import_and_report(client, monkeypatch):
     assert http.delete(base).is_success
 
 
+def test_report_status_matches_across_imports_and_allows_regeneration(client, monkeypatch):
+    http, other = client
+    base, first_version, first_catalog = prepare(http, [*SMALL, (*SMALL[0][:4], *SMALL[2][4:])])
+    status_url = base + "/report-status"
+    old_params = {"dataset_id": first_version}
+    assert successful(http.get(status_url, params=old_params)) == {
+        "dataset_id": first_version, "current_org_ids": [], "historical_org_ids": [],
+    }
+    assert http.get(status_url, params=old_params, headers=other).status_code == 404
+    old_orgs = first_catalog["organizations"]
+    generated = {row["id"] for row in old_orgs if row["level"] == "province" or
+                 row["path"].endswith((" / 甲市", " / 甲市 / 同名区")) or row["school_code"] == "11"}
+    school = next(row for row in old_orgs if row["school_code"] == "11")
+    failed_school = next(row for row in old_orgs if row["school_code"] == "21")
+    teacher = next(row["id"] for row in first_catalog["questionnaires"] if row["name"] == "教师")
+    process_report = survey_worker.process_report
+
+    async def fail_unfinished_reports(report_id):
+        with SessionLocal() as db:
+            job = db.get(SurveyReport, report_id)
+            if job.org_id == failed_school["id"] or job.org_id == school["id"] and job.questionnaires == [teacher]:
+                raise ValueError("测试出报失败")
+        await process_report(report_id)
+
+    monkeypatch.setattr(survey_worker, "process_report", fail_unfinished_reports)
+    first_batch = successful(http.post(base + "/batches", json={
+        **old_params, "mode": "custom", "org_ids": sorted(generated | {failed_school["id"]}),
+        "levels": {"school": {"split": True}}, "request_id": str(uuid4()),
+    }))["id"]
+    first_url = f"{base}/batches/{first_batch}"
+    result = await_state(http, first_url, lambda row: row["counts"]["done"] + row["counts"]["failed"] == row["total"])
+    assert result["counts"]["done"] == 4 and result["counts"]["failed"] == 2
+    first_report = next(row for row in result["reports"] if row["org_id"] == school["id"] and row["state"] == "done")
+    download = f"{first_url}/reports/{first_report['id']}/download"
+    original_file = http.get(download)
+    assert original_file.is_success
+    assert successful(http.get(status_url, params=old_params))["current_org_ids"] == sorted(generated)
+
+    renamed = ("新校名", *SMALL[0][1:])
+    source = successful(http.post(base + "/assets", data={"kind": "data"},
+                                  files={"file": ("新版答卷.xlsx", workbook([SMALL[-1], renamed, SMALL[2]]))}))
+    version = successful(http.post(base + "/imports", json={
+        "sources": [{"asset_id": source["id"], "sheets": source["sheets"]}],
+    }))["id"]
+    await_state(http, base, lambda row: row["dataset_id"] == version)
+    assert http.get(status_url, params=old_params).status_code == 409
+    assert successful(http.delete(f"{base}/imports/{first_version}"))["ok"]
+    params = {"dataset_id": version}
+    current_catalog = successful(http.get(base + "/catalog", params=params))
+    schools = {row["school_code"]: row for row in current_catalog["organizations"] if row["level"] == "school"}
+    assert schools["11"]["name"] == "新校名" and schools["11"]["id"] != school["id"]
+    historical = {row["id"] for row in current_catalog["organizations"] if row["level"] == "province" or
+                  row["path"].endswith((" / 甲市", " / 甲市 / 同名区")) or row["school_code"] == "11"}
+    assert successful(http.get(status_url, params=params)) == {
+        "dataset_id": version, "current_org_ids": [], "historical_org_ids": sorted(historical),
+    }
+
+    template = successful(http.post(base + "/assets", data={"kind": "template", "level": "school"},
+                                    files={"file": ("本次模板.docx", docx_template("新的标题"))}))
+    template_id = successful(http.put(f"{base}/templates/{template['id']}",
+                                      json={"title_index": 1, "body_index": 2}))["id"]
+    qid = next(row["id"] for row in current_catalog["questionnaires"] if row["name"] == "学生")
+    questions = successful(http.get(base + "/questions", params=params))
+    question = next(row for row in questions if row["title"] == "数值" and row["questionnaire"] == qid)
+    indicator_id = successful(http.post(base + "/indicators", json={
+        **params, "rules": [{"name": "本次指标", "question_id": question["id"], "method": "mean"}],
+    }))["id"]
+    settings = {**params, "mode": "custom", "org_ids": [schools["11"]["id"], schools["21"]["id"]],
+                "levels": {"school": {"questionnaires": [qid], "templates": [template_id]}},
+                "indicator_id": indicator_id}
+    assert successful(http.post(base + "/preview", json={**settings, "automatic": True}))["reports"] == 2
+    monkeypatch.setattr(survey_worker, "process_report", process_report)
+    request = {**settings, "request_id": str(uuid4())}
+    batch_id = successful(http.post(base + "/generate", json=request))["id"]
+    assert batch_id != first_batch
+    assert successful(http.post(base + "/generate", json=request))["id"] == batch_id
+    batch_url = f"{base}/batches/{batch_id}"
+    batch = await_state(http, batch_url, lambda row: row["counts"]["done"] == 2 or row["counts"]["failed"])
+    assert batch["counts"]["done"] == 2
+    assert all(row["questionnaires"] == ["学生"] for row in batch["reports"])
+    with SessionLocal() as db:
+        assert db.get(SurveyBatch, batch_id).indicator_id == indicator_id
+        assert all(db.get(SurveyReport, row["id"]).template_id == template_id for row in batch["reports"])
+    assert all(http.get(f"{batch_url}/reports/{row['id']}/download").is_success for row in batch["reports"])
+    status = successful(http.get(status_url, params=params))
+    assert status["current_org_ids"] == sorted(settings["org_ids"])
+    assert status["historical_org_ids"] == sorted(historical)
+    assert http.get(download).content == original_file.content
+
+
 def test_scope_indicators_templates_versions_and_downloads(client):
     http, other = client
     base, dataset_id, catalog = prepare(http, SMALL)

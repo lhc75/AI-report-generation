@@ -411,6 +411,44 @@ def catalog(project_id: int, dataset_id: int, user: User = Depends(get_current_u
                 "school_roster_id": roster.id if roster else None}
 
 
+@router.get("/{project_id}/report-status")
+def report_status(project_id: int, dataset_id: int, user: User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    project = owned(db, project_id, user)
+    if project.dataset_id != dataset_id:
+        raise HTTPException(409, "当前答卷版本已更新，请刷新")
+    with dataset(db, project_id, dataset_id) as index:
+        schools = {}
+        jurisdictions = {}
+        for org in index.execute("SELECT id,level,school_code,path FROM org"):
+            if org["level"] == "school":
+                schools[org["school_code"]] = org["id"]
+            else:
+                jurisdictions[org["level"], org["path"]] = org["id"]
+
+    reports = db.execute(select(SurveyBatch.dataset_id, SurveyReport.org_id, SurveyReport.org_level,
+                                SurveyReport.org_path).join(SurveyReport, SurveyReport.batch_id == SurveyBatch.id)
+                         .where(SurveyBatch.project_id == project_id, SurveyReport.state == "done").distinct())
+    current = set()
+    historical = set()
+    historical_schools = {}
+    for version, org_id, level, path in reports:
+        if version == dataset_id:
+            current.add(org_id)
+        elif level == "school":
+            historical_schools.setdefault(version, set()).add(org_id)
+        elif (level, path) in jurisdictions:
+            historical.add(jurisdictions[level, path])
+
+    # Historical school names and row IDs may change between imports.
+    for version, completed in historical_schools.items():
+        with dataset(db, project_id, version) as index:
+            for org in index.execute("SELECT id,school_code FROM org WHERE level='school'"):
+                if org["id"] in completed and org["school_code"] in schools:
+                    historical.add(schools[org["school_code"]])
+    return {"dataset_id": dataset_id, "current_org_ids": sorted(current), "historical_org_ids": sorted(historical)}
+
+
 @router.get("/{project_id}/questions")
 def questions(project_id: int, dataset_id: int, question_id: int | None = None,
               user: User = Depends(get_current_user), db: Session = Depends(get_db)):

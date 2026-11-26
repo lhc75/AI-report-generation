@@ -247,6 +247,10 @@
               <el-select v-model="orgStage" clearable placeholder="所有学段" aria-label="按学校学段筛选" class="medium-select">
                 <el-option v-for="(label, value) in schoolStages" :key="value" :value="value" :label="label" />
               </el-select>
+              <el-select v-model="orgReportFilter" clearable :disabled="!orgReportStatus"
+                         placeholder="所有出报状态" aria-label="按出报状态筛选" class="medium-select">
+                <el-option v-for="(state, key) in generationStatuses" :key="key" :value="key" :label="state.label" />
+              </el-select>
               <el-select v-model="jurisdiction" clearable filterable placeholder="所有辖区" class="wide-select"><el-option v-for="row in jurisdictions" :key="row.id" :label="row.path" :value="row.id" /></el-select>
               <el-button :disabled="!visibleOrganizations.length" @click="chooseRows(visibleOrganizations, true)">全选筛选结果</el-button>
               <el-button :disabled="!visibleOrganizations.length" @click="chooseRows(visibleOrganizations, false)">取消筛选结果</el-button>
@@ -258,6 +262,10 @@
             <el-table :data="organizationPage" height="319">
               <el-table-column width="56"><template #default="{ row }"><el-checkbox :model-value="isSelected(row.id)" :aria-label="'选择 ' + row.name" @change="value => chooseRows([row], value)" /></template></el-table-column>
               <el-table-column label="组织" min-width="300"><template #default="{ row }"><span :style="{ paddingLeft: levels.findIndex(([key]) => key === row.level) * 9 + 'px' }">{{ displayOrg(row.path, row.school_stage) }}</span></template></el-table-column>
+              <el-table-column label="出报状态" width="120"><template #default="{ row }">
+                <el-tag v-if="orgReportStatus" :type="generationStatus(row.id).type" size="small">{{ generationStatus(row.id).label }}</el-tag>
+                <span v-else class="muted">待查询</span>
+              </template></el-table-column>
               <el-table-column label="层级" width="85"><template #default="{ row }">{{ levelNames[row.level] }}</template></el-table-column>
               <el-table-column prop="school_code" label="学校 ID" width="115" />
               <el-table-column label="辖区" width="90"><template #default="{ row }"><el-button v-if="row.level !== 'school'" type="primary" link @click="jurisdiction = row.id">查看</el-button></template></el-table-column>
@@ -321,6 +329,13 @@
             <div class="toolbar spaced"><el-input v-model="previewSearch" clearable :prefix-icon="Search" placeholder="搜索清单中的组织" class="wide-select" /></div>
             <el-table :data="previewPageRows" height="330">
               <el-table-column label="组织" min-width="240"><template #default="{ row }">{{ displayOrg(row.path, row.school_stage) }}</template></el-table-column>
+              <el-table-column label="出报状态" width="120"><template #default="{ row }">
+                <template v-if="orgReportStatus">
+                  <el-tag :type="generationStatus(row.id).type" size="small">{{ generationStatus(row.id).label }}</el-tag>
+                  <div v-if="row.reports && generationStatus(row.id) !== generationStatuses.none" class="rerun-label">重新生成</div>
+                </template>
+                <span v-else class="muted">待查询</span>
+              </template></el-table-column>
               <el-table-column label="问卷及答卷数" min-width="245"><template #default="{ row }">
                 <div v-for="(count, key) in row.samples" :key="key">
                   {{ preview.questionnaires[key] }} · {{ count.toLocaleString() }}
@@ -473,6 +488,21 @@ const selection = reactive(emptySelection())
 const orgSearch = ref('')
 const orgLevel = ref('')
 const orgStage = ref('')
+const orgReportFilter = ref('')
+const orgReportStatus = ref(null)
+const generationStatuses = {
+  current: { label: '已生成', type: 'success' },
+  historical: { label: '历史已生成', type: 'warning' },
+  none: { label: '未生成', type: 'info' },
+}
+const orgStatusById = computed(() => {
+  const status = new Map()
+  for (const orgId of orgReportStatus.value?.historical_org_ids || []) status.set(orgId, 'historical')
+  for (const orgId of orgReportStatus.value?.current_org_ids || []) status.set(orgId, 'current')
+  return status
+})
+const reportStatusKey = orgId => orgStatusById.value.get(orgId) || 'none'
+const generationStatus = orgId => generationStatuses[reportStatusKey(orgId)]
 const jurisdiction = ref(null)
 const orgPage = ref(1)
 const preview = ref(null)
@@ -506,6 +536,7 @@ const visibleOrganizations = computed(() => {
   return orgs.value.filter(org =>
     (!orgLevel.value || org.level === orgLevel.value) &&
     (!orgStage.value || org.school_stage === orgStage.value) &&
+    (!orgReportFilter.value || reportStatusKey(org.id) === orgReportFilter.value) &&
     (!jurisdiction.value || inJurisdiction(org, jurisdiction.value, orgById.value)) &&
     (!keyword || org.path.toLowerCase().includes(keyword) || org.school_code?.toLowerCase().includes(keyword)))
 })
@@ -848,7 +879,10 @@ const baseKey = computed(() => {
   return JSON.stringify(base)
 })
 watch(baseKey, () => { preview.value = null })
-watch([orgSearch, orgLevel, orgStage, jurisdiction], () => { orgPage.value = 1 })
+watch([orgSearch, orgLevel, orgStage, orgReportFilter, jurisdiction], () => { orgPage.value = 1 })
+watch(() => visibleOrganizations.value.length, total => {
+  orgPage.value = Math.min(orgPage.value, Math.max(1, Math.ceil(total / 30)))
+})
 watch(previewSearch, () => { previewPage.value = 1 })
 watch([zipLevel, zipOrg], () => { zipPart.value = 1 })
 
@@ -881,6 +915,30 @@ async function submitBatch() {
 }
 
 let projectLoad = 0
+let reportStatusLoad = 0
+let reportStatusCheckedAt = 0
+
+async function loadReportStatus() {
+  const current = id.value
+  const datasetId = project.value?.dataset_id
+  if (!current || !datasetId) return
+  const load = ++reportStatusLoad
+  reportStatusCheckedAt = Date.now()
+  try {
+    const { data } = await api.get('/surveys/' + current + '/report-status', {
+      params: { dataset_id: datasetId }, silentError: true,
+    })
+    if (id.value === current && project.value?.dataset_id === datasetId && load === reportStatusLoad) {
+      orgReportStatus.value = data
+    }
+  } catch (error) {
+    if (error.response?.status === 409 && id.value === current
+        && project.value?.dataset_id === datasetId && load === reportStatusLoad) {
+      await loadProject()
+    }
+  }
+}
+
 async function loadProject() {
   const current = id.value
   if (!current) return
@@ -936,7 +994,9 @@ async function loadBatch() {
   })
   if (id.value !== activeProject || batchId.value !== activeBatch || reportState.value !== state || offset !== (reportPage.value - 1) * 50) return
   const oldDataset = batch.value?.dataset_id
+  const previousDone = batch.value?.id === data.id ? batch.value.counts.done : 0
   batch.value = data
+  if (data.counts.done > previousDone) void loadReportStatus().catch(() => {})
   if (oldDataset !== data.dataset_id || !batchJurisdictions.value.length) {
     if (data.dataset_id === project.value?.dataset_id && catalog.value) batchJurisdictions.value = jurisdictions.value
     else {
@@ -1012,6 +1072,9 @@ function downloadSchoolTemplate() {
 
 watch(id, async active => {
   projectLoad++
+  reportStatusLoad++
+  orgReportStatus.value = null
+  orgReportFilter.value = ''
   project.value = null
   catalog.value = null
   batch.value = null
@@ -1047,6 +1110,15 @@ watch(id, async active => {
     else projects.value = (await api.get('/surveys')).data
   } catch { /* error handled by API interceptor */ }
 }, { immediate: true })
+watch([tab, () => project.value?.dataset_id], ([activeTab, datasetId], [, previousDatasetId]) => {
+  if (datasetId !== previousDatasetId) {
+    orgReportStatus.value = null
+    orgReportFilter.value = ''
+  }
+  if (datasetId && (activeTab === 'plan' || datasetId !== previousDatasetId)) {
+    void loadReportStatus().catch(() => {})
+  }
+})
 watch(batchId, () => {
   reportPage.value = 1
   zipOrg.value = null
@@ -1062,6 +1134,7 @@ const timer = setInterval(async () => {
   polling = true
   try {
     if (importing.value) await loadProject()
+    if (tab.value === 'plan' && Date.now() - reportStatusCheckedAt >= 5000) await loadReportStatus()
     if (tab.value === 'batches' && batch.value?.generation?.state !== 'failed'
         && (batch.value?.counts.queued || batch.value?.counts.running)) await refreshBatches()
   } catch { /* error handled by API interceptor */ }
@@ -1077,6 +1150,7 @@ h1 { font-size: 24px; margin: 4px 0 7px; overflow-wrap: anywhere; }
 h2 { font-size: 17px; margin: 0; }
 h3 { font-size: 14px; margin: 7px 0; overflow-wrap: anywhere; }
 .muted { color: var(--el-text-color-secondary); font-size: 14px; }
+.rerun-label { margin-top: 2px; font-size: 12px; color: var(--el-text-color-secondary); }
 .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .toolbar :deep(.el-button + .el-button) { margin-left: 0; }
 .spaced { margin-top: 14px; }
